@@ -55,23 +55,23 @@ The first branch fires on the live DB. So you now have two super_admins:
 
 ### 2.2 Email pipeline — diagnosed 2026-05-13
 
-Email-health probe shows the root cause clearly:
-- ❌ `MAIL_FROM = Pharmabox24 <onboarding@resend.dev>` — this is Resend's **sandbox sender**. It can only deliver to the email that owns the Resend account. Every send to anyone else → 403.
-- ❌ `SITE_URL = https://your-app.railway.app` — placeholder from `.env.example`, never updated to the live custom domain. Means every email link is broken even when sends succeed.
-- ✅ `RESEND_API_KEY` set (36 chars — correct length).
-- ❌ `GET /domains` returns HTTP 403 — likely because **no sending domain has been added on Resend**.
+Verified state (from email-health probe + Resend dashboard screenshot):
+- ✅ `pharmabox24.co.uk` is verified on Resend (Ireland, eu-west-1, added ~April 2026). "Ready to send", all DNS records green.
+- ✅ `RESEND_API_KEY` set (36 chars). Likely scoped to "Sending access" only — that's why the probe's `GET /domains` returned 403. Sending will still work; only the diagnostic enumeration is blocked. Correct least-privilege posture; do not change.
+- ❌ `MAIL_FROM = Pharmabox24 <onboarding@resend.dev>` — still the **sandbox sender**. Can only deliver to the account owner. Every external send (e.g. `mark.piper1@nhs.net`) → 403.
+- ❌ `SITE_URL = https://your-app.railway.app` — placeholder from `.env.example`. Every email link is broken even when sends succeed.
 
-**Fix (4 steps):**
-1. On Resend dashboard → Domains → Add Domain. Use a subdomain like `mail.pharmabox24.co.uk`.
-2. Add the three DNS records Resend gives you (MX, SPF TXT, DKIM TXT) wherever DNS for `pharmabox24.co.uk` is managed.
-3. Wait for green "Verified" status (usually within an hour).
-4. On Railway → Variables, update:
-   - `MAIL_FROM=Pharmabox24 <noreply@mail.pharmabox24.co.uk>`
-   - `SITE_URL=https://managementinfo.pharmabox24.co.uk`
-   - Restart the service.
-5. Hit `/admin/email-health` → click "Send test email". Should land in inbox.
+**Fix (single restart):**
+On Railway → Variables, update:
+```
+MAIL_FROM=Pharmabox24 <noreply@pharmabox24.co.uk>
+SITE_URL=https://managementinfo.pharmabox24.co.uk
+```
+Restart the service. Hit `/admin/email-health` → "Send test email". Should land in inbox.
 
-**NHSmail nuance:** even after Resend stops returning 403, NHSmail (the recipient at `mark.piper1@nhs.net`) is strict about inbound. Ensure SPF+DKIM+DMARC are aligned. Add a `p=none` DMARC record at `_dmarc.pharmabox24.co.uk` initially to get failure reports without bouncing.
+(Local-part of MAIL_FROM is free choice — `noreply@`, `notifications@`, `info@` all work as long as the domain is `pharmabox24.co.uk`.)
+
+**NHSmail nuance:** NHSmail (the recipient at `mark.piper1@nhs.net`) is strict about inbound. SPF + DKIM are already in place via Resend's DNS records. Add a `p=none` DMARC record at `_dmarc.pharmabox24.co.uk` initially to get failure reports without bouncing. If the first NHS-bound send lands in junk, ask Mark to "Not junk" it once — NHSmail learns per-user.
 
 ---
 
