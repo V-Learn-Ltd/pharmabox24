@@ -161,7 +161,11 @@ def send_email(to_email, subject, html_content):
         data=payload,
         headers={
             'Authorization': f'Bearer {api_key}',
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
+            # Resend sits behind Cloudflare; the default Python-urllib/X user-agent gets
+            # WAF-rejected (error code 1010). A descriptive UA satisfies the bot filter.
+            'User-Agent': 'Pharmabox24/1.0 (+https://managementinfo.pharmabox24.co.uk)',
+            'Accept': 'application/json',
         },
         method='POST'
     )
@@ -1420,6 +1424,9 @@ def _resend_probe():
         headers={
             'Authorization': f'Bearer {api_key}',
             'Content-Type': 'application/json',
+            # Same Cloudflare WAF reason as in send_email() — see comment there.
+            'User-Agent': 'Pharmabox24/1.0 (+https://managementinfo.pharmabox24.co.uk)',
+            'Accept': 'application/json',
         },
         method='GET',
     )

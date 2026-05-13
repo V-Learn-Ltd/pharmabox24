@@ -5,11 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}Pharmabox24{% endblock %}</title>
     <!-- SRI temporarily disabled on all CDN scripts — see HANDOFF.md § 5.2.
-         The hashes I computed via curl didn't match what browsers actually receive
-         (likely due to jsdelivr's content negotiation). Re-enable once we self-host. -->
-    <script defer
-            src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js"
-            crossorigin="anonymous"></script>
+         crossorigin="anonymous" also dropped (was paired with the removed integrity= attrs;
+         keeping it caused stale SRI-failure cache entries to persist in some browsers). -->
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js"></script>
     <script src="https://cdn.tailwindcss.com/3.4.17"></script>
     <script>
         tailwind.config = {
