@@ -31,16 +31,17 @@
                 {% endfor %}
             </div>
 
-            <div>
-                <label for="password" class="block text-sm font-medium text-gray-700 mb-1">
-                    Password
-                    {% if user %}<span class="text-gray-400 font-normal">(leave blank to keep current)</span>{% endif %}
-                </label>
-                {{ form.password(class="block w-full px-3 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500", placeholder="Minimum 6 characters") }}
-                {% for error in form.password.errors %}
-                <p class="mt-1 text-sm text-red-600">{{ error }}</p>
-                {% endfor %}
+            {% if not user %}
+            <div class="p-3 rounded-lg bg-blue-50 border border-blue-100 text-sm text-blue-800">
+                <i class="fas fa-envelope mr-1"></i>
+                After you save, we'll email this person a one-time link to set their own password and activate their account. The link is valid for 7 days.
             </div>
+            {% else %}
+            <div class="p-3 rounded-lg bg-gray-50 border border-gray-200 text-sm text-gray-700">
+                <i class="fas fa-lock mr-1"></i>
+                To change a user's password, use <strong>Send password reset</strong> on the Users list — they'll receive a reset email they can complete themselves.
+            </div>
+            {% endif %}
 
             <div>
                 <label for="role" class="block text-sm font-medium text-gray-700 mb-1">Role</label>

@@ -56,8 +56,8 @@
             <li>Go to <strong>Pharmacies</strong> and click the edit icon on each pharmacy that belongs to that chain.</li>
             <li>Select the <strong>Organisation</strong> from the dropdown and save.</li>
             <li>Go to <strong>Users</strong> and click <strong>Add User</strong>.</li>
-            <li>Set the role to <strong>Organisation Admin</strong>, select the <strong>Organisation</strong>, set a password, and save.</li>
-            <li>Give the organisation admin their login details. When they log in, they'll see all their branches in one dashboard.</li>
+            <li>Set the role to <strong>Organisation Admin</strong>, select the <strong>Organisation</strong>, and save.</li>
+            <li>The new org admin receives an invitation email — they click the link, set their own password, and instantly see every pharmacy in their organisation.</li>
         </ol>
         <div class="bg-pharma-50 border border-pharma-200 rounded-lg p-4">
             <p class="text-sm text-pharma-800"><strong>Good to know:</strong></p>
@@ -123,28 +123,45 @@
             Click <strong>Users</strong> in the sidebar to manage who can log in.
         </p>
 
+        <div class="p-3 mb-4 rounded-lg bg-blue-50 border border-blue-100 text-sm text-blue-800">
+            <strong><i class="fas fa-envelope mr-1"></i> How user creation works:</strong>
+            you no longer set passwords for other users. When you add someone, we email them an
+            invitation link. They click the link, choose their own password, and the account
+            activates instantly. The invitation is valid for 7 days.
+        </div>
+
         <h3 class="font-semibold text-gray-700 mb-2">To create a pharmacy user:</h3>
         <ol class="list-decimal list-inside text-gray-600 space-y-2 mb-4">
             <li>Click <strong>Add User</strong>.</li>
-            <li>Enter their email address and name.</li>
-            <li>Set a password (minimum 6 characters). Give this to them so they can log in.</li>
+            <li>Enter their email address and full name.</li>
             <li>Set the role to <strong>Pharmacy User</strong>.</li>
             <li>Select their <strong>Pharmacy</strong> from the dropdown.</li>
-            <li>Click Save.</li>
+            <li>Click <strong>Save</strong>. An invitation email goes out automatically.</li>
         </ol>
 
         <h3 class="font-semibold text-gray-700 mb-2">To create an organisation admin:</h3>
         <ol class="list-decimal list-inside text-gray-600 space-y-2 mb-4">
             <li>Click <strong>Add User</strong>.</li>
-            <li>Enter their email address and name.</li>
-            <li>Set a password (minimum 6 characters).</li>
+            <li>Enter their email address and full name.</li>
             <li>Set the role to <strong>Organisation Admin</strong>.</li>
             <li>Select their <strong>Organisation</strong> from the dropdown.</li>
-            <li>Click Save. They'll see all pharmacies belonging to that organisation when they log in.</li>
+            <li>Click <strong>Save</strong>. When they accept the invite and log in, they'll see every pharmacy in that organisation.</li>
         </ol>
 
+        <h3 class="font-semibold text-gray-700 mb-2">Resending invitations and resetting passwords</h3>
+        <p class="text-gray-600 mb-2">
+            On the Users list, each row has three quick actions to the right of the user's name:
+        </p>
+        <ul class="text-gray-600 space-y-2 mb-4">
+            <li><i class="fas fa-edit text-blue-600 mr-2"></i><strong>Edit</strong> — change name, email, role, pharmacy/organisation assignment. (No password field — see the two buttons below.)</li>
+            <li><i class="fas fa-paper-plane text-green-600 mr-2"></i><strong>Resend invitation</strong> — re-sends the welcome/activation email. Use this if a new user lost their email or it landed in junk. Valid until they set a password for the first time.</li>
+            <li><i class="fas fa-key text-amber-600 mr-2"></i><strong>Send password reset</strong> — use this for an existing user who has forgotten their password. Sends them a 1-hour reset link.</li>
+            <li><i class="fas fa-trash text-red-600 mr-2"></i><strong>Delete</strong> — removes the user. You can't delete yourself or the last super_admin.</li>
+        </ul>
+
         <p class="text-gray-600">
-            To edit a user, click the edit icon. Leave the password field blank to keep their existing password.
+            Users can also reset their own passwords at any time using <strong>Forgot Password</strong>
+            on the login page — you don't need to do it for them.
         </p>
     </div>
 
@@ -175,8 +192,9 @@
         </h2>
         <ul class="list-disc list-inside text-gray-600 space-y-2">
             <li><strong>Change your own password:</strong> Click your name in the top-right corner, then "Change Password".</li>
-            <li><strong>Reset a user's password:</strong> Go to Users, click edit on their account, and enter a new password.</li>
-            <li><strong>Forgot password:</strong> On the login page there's a "Forgot Password" link. This sends a reset email to the user's address.</li>
+            <li><strong>Reset a user's password:</strong> On the Users list, click the orange <i class="fas fa-key text-amber-600"></i> button next to that user. They'll receive a reset email with a 1-hour link.</li>
+            <li><strong>Forgot password (user-initiated):</strong> The login page has a "Forgot Password" link. Users can reset their own passwords any time — you don't need to do it for them.</li>
+            <li><strong>Minimum password length:</strong> 8 characters.</li>
         </ul>
     </div>
 

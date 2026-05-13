@@ -117,11 +117,8 @@
                     <span class="ml-3">Users</span>
                 </a>
                 <hr class="my-3 border-gray-200 mx-4">
-                <a href="{{ url_for('admin_email_health') }}"
-                   class="flex items-center px-4 py-3 text-gray-700 hover:bg-pharma-50 hover:text-pharma-700 rounded-lg mb-1 {% if request.endpoint == 'admin_email_health' %}bg-pharma-50 text-pharma-700{% endif %}">
-                    <i class="fas fa-envelope-circle-check w-5"></i>
-                    <span class="ml-3">Email Health</span>
-                </a>
+                {# Email Health route still exists at /admin/email-health — hidden from
+                   the sidebar now that email is working. Navigate directly when needed. #}
                 <a href="{{ url_for('admin_help') }}"
                    class="flex items-center px-4 py-3 text-gray-700 hover:bg-pharma-50 hover:text-pharma-700 rounded-lg mb-1 {% if request.endpoint == 'admin_help' %}bg-pharma-50 text-pharma-700{% endif %}">
                     <i class="fas fa-circle-question w-5"></i>

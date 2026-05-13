@@ -131,7 +131,27 @@ a06ee6b  Drop SRI hash from cdn.tailwindcss.com — it's a runtime JIT compiler
 - **N+1 dashboard queries fixed (#12).** `get_pharmacy_stats_batch()` does 4 grouped aggregate queries regardless of pharmacy count. Replaces 5-queries-per-pharmacy loops in `admin_dashboard` and `org_dashboard`. Benchmark at 30 pharmacies × 60 days: 47.9ms → 3.3ms (14.7× speedup) on local SQLite; bigger multiple on Railway Postgres. **The "will bite at 20+ pharmacies" risk is now closed.**
 - **Cloudflare error 1010 on Resend** — Resend's API sits behind Cloudflare WAF, which now rejects requests with the default `Python-urllib/X` user-agent. Both `send_email()` POST and `_resend_probe()` GET now set a descriptive User-Agent.
 - **All CDN SRI hashes removed.** The hashes I computed via `curl` didn't match what browsers actually receive (jsdelivr does content-negotiation/encoding-aware compression that changes the served bytes). `crossorigin="anonymous"` also dropped to force a fresh fetch past jsdelivr's `immutable` cache headers (which can pin a failed-SRI state in browsers even through hard-refresh). Proper fix is self-host (§ 4.2 #15).
+- **Alpine.js removed entirely**, replaced with 12 lines of inline vanilla JS for the user-menu dropdown. One fewer CDN dependency.
 - **Two-super_admin situation surfaced.** First production admin sync collided with an existing `info@pharmabox24.co.uk` user; the rewritten admin-sync logic now promotes that row to super_admin instead of trying to overwrite emails. Result is two super_admin rows by design until you reconcile (§ 2.1).
+- **Email pipeline live.** `pharmabox24.co.uk` verified on Resend; `MAIL_FROM` and `SITE_URL` corrected; Resend API key rotated; dead Gmail SMTP env vars purged.
+
+### 3.3 Invitation-based user onboarding (landed 2026-05-13)
+
+The "admin types a password for the new user" pattern is gone. New flow:
+
+- **Admin user creation** — fill in email + name + role + pharmacy/org. No password field. On save, the system creates the row with an unguessable random hash and emails the new user an activation link (7-day validity).
+- **The invitation email** uses the Pharmabox24 logo and a clean layout. Subject: "Welcome to Pharmabox24 — activate your account."
+- **The new user** clicks the link, lands on `/setup-account/<token>`, sets their own password, gets logged in automatically, redirected to their dashboard.
+- **Users list** now has three quick actions per row: edit, resend invitation (paper plane), send password reset (key). Edit no longer has a password field.
+- **Existing users still work** — their old passwords are intact. They use "Forgot Password" or admin's "Send password reset" button if they need a new one.
+- **Token security** — invite tokens use `itsdangerous` HMAC with a dedicated salt (`pharmabox-account-invite-v1`), 7-day expiry, bound to `session_version` so they self-invalidate the moment the user sets a password.
+
+**Also landed in this commit:**
+- Password minimum: **8 characters** (down from 12 — NIST baseline, paired with rate limiting and pbkdf2-sha256 it's the right balance for pharmacy staff usability).
+- Permission-decorator flash is now blue-info instead of red-error, with friendlier wording ("That page is for administrators — showing your dashboard instead."). Fixes the "Julie sees a red error bar on her own pharmacy dashboard" confusion.
+- `_safe_next` is role-aware — login flow now drops `/admin/*` paths for pharmacy users so they don't get bounced through admin-deny on login.
+- All emails (notification, password reset, password changed, invitation) share a single `_email_layout()` helper with the Pharmabox24 logo at top.
+- Email Health link hidden from the sidebar (route still works at `/admin/email-health`).
 
 ---
 
@@ -191,7 +211,13 @@ Per § 2.1. Resolve manually via `/admin/users`.
 ### 5.6 Backup service
 Separate Railway service running `backup/backup.py` on a cron (`0 2 * * *` UTC). Stores `.sql.gz` files on a `/data` volume, retains 7 days. Notifies via Resend if configured (`BACKUP_NOTIFY_EMAIL`). The script no longer uses `shell=True`; pg_dump is called via `subprocess.Popen` with libpq env vars piped to `gzip.open()` in Python.
 
-### 5.7 Gmail shows a WordPress "W" icon next to outgoing emails
+### 5.7.5 Password length minimum is 8, not 12
+NIST SP 800-63B baseline. Rate-limiting (5/5min/IP/worker) + pbkdf2-sha256 at 600k iterations make online brute-force and offline cracking impractical at this length. Going below 8 is unsafe; going above 8 costs UX (pharmacy staff with sticky notes) for diminishing security returns.
+
+### 5.8 User onboarding via invitation, never admin-typed passwords
+Admins enter email + name + role; the system mails an activation link. Users set their own passwords. Reset is admin-triggered ("Send password reset" button) or user-initiated ("Forgot password" on the login page). Admin pages no longer expose a password field — see `/admin/help` (Managing Users section) for the operator-facing version of this.
+
+### 5.9 Gmail shows a WordPress "W" icon next to outgoing emails
 Not coming from our HTML — it's Gmail's **sender-avatar lookup**. Gmail builds the circular avatar next to the sender name by checking Gravatar.com for the `From:` address. The `pharmabox24.co.uk` apex domain runs WordPress, and WordPress auto-registers Gravatar profiles for its admin emails (often `admin@`, `info@`, `noreply@`) using a WP-themed default avatar. Gmail finds that and displays it.
 
 **Three fixes (pick one):**

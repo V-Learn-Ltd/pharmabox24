@@ -2,6 +2,7 @@ import os
 import json
 import time
 import uuid
+import secrets
 import zipfile
 import logging
 from collections import defaultdict
@@ -201,6 +202,70 @@ def _safe_int(value, default=0):
         return default
 
 
+def _site_url():
+    """Base URL used in emails for links and the logo. Falls back to the request host."""
+    site = app.config.get('SITE_URL') or ''
+    if site:
+        return site.rstrip('/')
+    try:
+        return request.host_url.rstrip('/')
+    except RuntimeError:
+        return ''
+
+
+def _email_layout(preheader, body_html):
+    """Wrap an email body in the standard Pharmabox24 chrome with the logo at top.
+
+    All emails go through this helper so branding stays consistent. The logo is loaded
+    from the live site's /static/images/logo.png; Gmail and Apple Mail render it
+    automatically, Outlook desktop requires the user to enable images for the sender.
+    """
+    site = _site_url()
+    logo_url = f'{site}/static/images/logo.png' if site else ''
+    safe_pre = escape(preheader or '')
+    logo_block = (
+        f'<img src="{escape(logo_url)}" alt="Pharmabox24" '
+        f'style="max-height: 48px; display: block; margin: 0 auto;">'
+    ) if logo_url else (
+        '<div style="font-family: Arial, sans-serif; font-size: 24px; font-weight: 900; '
+        'color: white; letter-spacing: -1px;">Pharmabox24</div>'
+    )
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Pharmabox24</title>
+</head>
+<body style="margin: 0; padding: 0; background: #f4f5f7; font-family: Arial, sans-serif; color: #333;">
+    <!-- preheader (hidden but shown in inbox preview) -->
+    <div style="display: none; max-height: 0; overflow: hidden;">{safe_pre}</div>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+        <tr>
+            <td align="center" style="padding: 24px 12px;">
+                <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="max-width: 600px; width: 100%;">
+                    <tr>
+                        <td style="background: linear-gradient(135deg, #00891a, #006913); padding: 24px; text-align: center; border-radius: 8px 8px 0 0;">
+                            {logo_block}
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="background: #ffffff; padding: 32px 28px; line-height: 1.6; color: #333;">
+                            {body_html}
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="background: #f9f9f9; padding: 16px 28px; text-align: center; color: #888; font-size: 12px; border-radius: 0 0 8px 8px;">
+                            Pharmabox24 — Prescription Collection Analytics Portal
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>"""
+
+
 def _today():
     """Return today's date in the configured display timezone (Europe/Dublin by default)."""
     tz_name = app.config.get('DISPLAY_TIMEZONE') or 'Europe/Dublin'
@@ -235,54 +300,31 @@ def send_notification_email(pharmacy, stats_summary):
     removed = _safe_int(stats_summary.get('removed'))
     safe_login = escape(login_url)
 
-    html_content = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <style>
-        body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
-        .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
-        .header {{ background: linear-gradient(135deg, #00891a, #006913); color: white; padding: 20px; text-align: center; border-radius: 8px 8px 0 0; }}
-        .content {{ background: #f9f9f9; padding: 20px; border-radius: 0 0 8px 8px; }}
-        .stats-card {{ background: white; padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 4px solid #00891a; }}
-        .stat-value {{ font-size: 24px; font-weight: bold; color: #00891a; }}
-        .btn {{ display: inline-block; background: #00891a; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; margin-top: 15px; }}
-        .footer {{ text-align: center; margin-top: 20px; color: #666; font-size: 12px; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1 style="margin: 0;">Pharmabox24</h1>
-            <p style="margin: 5px 0 0 0;">New Statistics Available</p>
-        </div>
-        <div class="content">
-            <p>Hello <strong>{safe_name}</strong>,</p>
-            <p>New statistics have been uploaded for your pharmacy. Here's a quick summary:</p>
+    body = f"""
+        <h2 style="color: #00891a; margin-top: 0;">New statistics available</h2>
+        <p>Hello <strong>{safe_name}</strong>,</p>
+        <p>New statistics have been uploaded for your pharmacy. Here's a quick summary:</p>
 
-            <div class="stats-card">
-                <div>Loaded Parcels</div>
-                <div class="stat-value">{loaded}</div>
-            </div>
-            <div class="stats-card">
-                <div>Collected Parcels</div>
-                <div class="stat-value">{collected}</div>
-            </div>
-            <div class="stats-card">
-                <div>Removed Parcels</div>
-                <div class="stat-value">{removed}</div>
-            </div>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin: 16px 0;">
+            <tr><td style="padding: 8px 0;"><div style="background: #f4f5f7; padding: 14px 16px; border-radius: 6px; border-left: 4px solid #00891a;">
+                <div style="font-size: 12px; color: #666; text-transform: uppercase;">Loaded Parcels</div>
+                <div style="font-size: 24px; font-weight: bold; color: #00891a;">{loaded}</div>
+            </div></td></tr>
+            <tr><td style="padding: 8px 0;"><div style="background: #f4f5f7; padding: 14px 16px; border-radius: 6px; border-left: 4px solid #00891a;">
+                <div style="font-size: 12px; color: #666; text-transform: uppercase;">Collected Parcels</div>
+                <div style="font-size: 24px; font-weight: bold; color: #00891a;">{collected}</div>
+            </div></td></tr>
+            <tr><td style="padding: 8px 0;"><div style="background: #f4f5f7; padding: 14px 16px; border-radius: 6px; border-left: 4px solid #00891a;">
+                <div style="font-size: 12px; color: #666; text-transform: uppercase;">Removed Parcels</div>
+                <div style="font-size: 24px; font-weight: bold; color: #00891a;">{removed}</div>
+            </div></td></tr>
+        </table>
 
-            <p style="text-align: center;">
-                <a href="{safe_login}" class="btn">View Full Analytics</a>
-            </p>
-        </div>
-        <div class="footer">
-            <p>Pharmabox24 - Prescription Collection Analytics Portal</p>
-        </div>
-    </div>
-</body>
-</html>"""
+        <p style="text-align: center; margin: 24px 0;">
+            <a href="{safe_login}" style="display: inline-block; background: #00891a; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: 600;">View full analytics</a>
+        </p>
+    """
+    html_content = _email_layout(f'New statistics for {pharmacy.name}', body)
 
     # Subject lines also surface user-controlled values — neutralise newlines/control chars.
     safe_subject_name = (pharmacy.name or '').replace('\r', ' ').replace('\n', ' ')[:120]
@@ -298,14 +340,69 @@ def send_password_changed_notice(user):
     if not user.email:
         return False
     safe_name = escape(user.name or '')
-    html = f"""
-<!DOCTYPE html>
-<html><body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
-<p>Hello <strong>{safe_name}</strong>,</p>
-<p>Your Pharmabox24 password was just changed. If this wasn't you, contact your administrator immediately.</p>
-<p style="font-size: 12px; color: #666;">Pharmabox24 — Prescription Collection Analytics Portal</p>
-</body></html>"""
+    body = f"""
+        <h2 style="color: #00891a; margin-top: 0;">Password changed</h2>
+        <p>Hello <strong>{safe_name}</strong>,</p>
+        <p>Your Pharmabox24 password was just changed.</p>
+        <p style="color: #666;">If this wasn't you, contact your administrator immediately.</p>
+    """
+    html = _email_layout('Your Pharmabox24 password was changed', body)
     return send_email(user.email, 'Pharmabox24 password changed', html)
+
+
+def send_password_reset_email(user, reset_url):
+    """Password reset link — used by both the public forgot-password flow and the
+    admin-triggered 'send reset' button on the user-edit page."""
+    safe_name = escape(user.name or '')
+    safe_url = escape(reset_url)
+    body = f"""
+        <h2 style="color: #00891a; margin-top: 0;">Password reset</h2>
+        <p>Hello <strong>{safe_name}</strong>,</p>
+        <p>You requested a password reset. Click the button below within 1 hour to set a new password:</p>
+        <p style="text-align: center; margin: 24px 0;">
+            <a href="{safe_url}" style="display: inline-block; background: #00891a; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: 600;">Reset password</a>
+        </p>
+        <p style="font-size: 12px; color: #666;">If you didn't request this, you can safely ignore this email.</p>
+    """
+    html = _email_layout('Reset your Pharmabox24 password', body)
+    return send_email(user.email, 'Password Reset - Pharmabox24', html)
+
+
+def send_invitation_email(user, setup_url):
+    """Sent when an admin adds a new user. Welcome + password-setup link.
+
+    The setup link is generated from a 7-day invitation token (separate salt from
+    reset tokens). Once the user sets a password, set_password() bumps session_version
+    which invalidates the invite token too.
+    """
+    safe_name = escape(user.name or '')
+    safe_email = escape(user.email or '')
+    safe_url = escape(setup_url)
+    role_label = (
+        'Super Administrator' if user.role == 'super_admin'
+        else 'Organisation Administrator' if user.role == 'org_admin'
+        else 'Pharmacy User'
+    )
+    body = f"""
+        <h2 style="color: #00891a; margin-top: 0;">Welcome to Pharmabox24</h2>
+        <p>Hello <strong>{safe_name}</strong>,</p>
+        <p>An account has been created for you on Pharmabox24, the prescription collection analytics portal.</p>
+        <table role="presentation" cellspacing="0" cellpadding="0" style="background: #f4f5f7; border-radius: 6px; margin: 16px 0; width: 100%;">
+            <tr><td style="padding: 14px 16px;">
+                <div style="font-size: 12px; color: #666; text-transform: uppercase;">Your login email</div>
+                <div style="font-size: 16px; font-weight: 600; color: #333;">{safe_email}</div>
+                <div style="font-size: 12px; color: #666; text-transform: uppercase; margin-top: 12px;">Your role</div>
+                <div style="font-size: 16px; font-weight: 600; color: #333;">{role_label}</div>
+            </td></tr>
+        </table>
+        <p>To activate your account, click the button below to set your password. This link is valid for 7 days.</p>
+        <p style="text-align: center; margin: 24px 0;">
+            <a href="{safe_url}" style="display: inline-block; background: #00891a; color: white; padding: 12px 28px; text-decoration: none; border-radius: 6px; font-weight: 600;">Set your password</a>
+        </p>
+        <p style="font-size: 13px; color: #666;">If you weren't expecting this invitation, you can safely ignore this email — no account will be activated until you set a password.</p>
+    """
+    html = _email_layout('Activate your Pharmabox24 account', body)
+    return send_email(user.email, 'Welcome to Pharmabox24 — activate your account', html)
 
 
 @login_manager.user_loader
@@ -341,8 +438,12 @@ def load_user(user_id):
 def super_admin_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if not current_user.is_authenticated or not current_user.is_super_admin():
-            flash('You do not have permission to access this page.', 'error')
+        if not current_user.is_authenticated:
+            return redirect(url_for('login', next=request.path))
+        if not current_user.is_super_admin():
+            # Soft notice instead of alarming red error — the user lands on a page they CAN
+            # access (their role-appropriate dashboard), so a red error bar is misleading.
+            flash('That page is for administrators — showing your dashboard instead.', 'info')
             return redirect(url_for('dashboard'))
         return f(*args, **kwargs)
     return decorated_function
@@ -352,8 +453,10 @@ def admin_required(f):
     """Allows super_admin OR org_admin (legacy 'admin' role treated as super_admin)."""
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if not current_user.is_authenticated or not current_user.is_admin():
-            flash('You do not have permission to access this page.', 'error')
+        if not current_user.is_authenticated:
+            return redirect(url_for('login', next=request.path))
+        if not current_user.is_admin():
+            flash('That page is for administrators — showing your dashboard instead.', 'info')
             return redirect(url_for('dashboard'))
         return f(*args, **kwargs)
     return decorated_function
@@ -385,24 +488,30 @@ class LoginForm(FlaskForm):
     remember_me = BooleanField('Keep me signed in on this device', default=False)
 
 
-_PASSWORD_MIN = 12
+# 8-char minimum (NIST SP 800-63B baseline) is the right floor for this app given:
+#   - online brute force is rate-limited (5 attempts / 5 min / IP / worker)
+#   - hashing is pbkdf2-sha256 @ 600k iterations (~150ms per guess on a modern GPU)
+#   - the audience (pharmacy staff) will work around longer minimums with sticky notes
+# Going below 8 is not safe; going much above 8 has diminishing returns AND a real UX cost.
+_PASSWORD_MIN = 8
 _PASSWORD_MAX = 128
 
 
 class UserForm(FlaskForm):
+    """Admin-side user form. NO password field — new users receive an emailed invitation
+    link to set their own password. Existing users keep their password until they reset it
+    (via /forgot-password) or an admin triggers a reset email."""
     email = EmailField('Email', validators=[DataRequired(), Email()])
     name = StringField('Name', validators=[DataRequired(), Length(min=2, max=100)])
-    password = PasswordField('Password', validators=[Length(min=_PASSWORD_MIN, max=_PASSWORD_MAX)])
     role = SelectField('Role', choices=[('pharmacy', 'Pharmacy User'), ('org_admin', 'Organisation Admin'), ('super_admin', 'Super Admin')])
     pharmacy_id = SelectField('Pharmacy', coerce=int)
     organisation_id = SelectField('Organisation', coerce=int)
 
 
 class OrgUserForm(FlaskForm):
-    """User form for org admins — can only create pharmacy users within their org."""
+    """User form for org admins. Like UserForm — no password field; invitation is emailed."""
     email = EmailField('Email', validators=[DataRequired(), Email()])
     name = StringField('Name', validators=[DataRequired(), Length(min=2, max=100)])
-    password = PasswordField('Password', validators=[Length(min=_PASSWORD_MIN, max=_PASSWORD_MAX)])
     pharmacy_id = SelectField('Pharmacy', coerce=int)
 
 
@@ -437,6 +546,12 @@ class ForgotPasswordForm(FlaskForm):
 class ResetPasswordForm(FlaskForm):
     new_password = PasswordField('New Password', validators=[DataRequired(), Length(min=_PASSWORD_MIN, max=_PASSWORD_MAX)])
     confirm_password = PasswordField('Confirm Password', validators=[DataRequired()])
+
+
+class SetupAccountForm(FlaskForm):
+    """Used by the new-user invitation flow at /setup-account/<token>."""
+    new_password = PasswordField('Choose a password', validators=[DataRequired(), Length(min=_PASSWORD_MIN, max=_PASSWORD_MAX)])
+    confirm_password = PasswordField('Confirm password', validators=[DataRequired()])
 
 
 # Password reset token helpers — HMAC-signed via itsdangerous, bound to the user's
@@ -479,6 +594,79 @@ def verify_reset_token(token, max_age=3600):
     return user
 
 
+# Invitation token helpers — same mechanism as reset tokens but a different salt
+# (so a leaked reset token can't be reused as an invite or vice versa) and a longer
+# default expiry (7 days, since invitations may take days to be acted on).
+_INVITE_SALT = 'pharmabox-account-invite-v1'
+_INVITE_MAX_AGE = 7 * 24 * 3600  # 7 days
+
+
+def _invite_serializer():
+    return URLSafeTimedSerializer(app.config['SECRET_KEY'], salt=_INVITE_SALT)
+
+
+def generate_invite_token(user):
+    return _invite_serializer().dumps({
+        'uid': user.id,
+        'sv': user.session_version or 1,
+    })
+
+
+def verify_invite_token(token, max_age=_INVITE_MAX_AGE):
+    """Verify an invitation token. Returns the User or None.
+
+    Token becomes invalid as soon as the user sets a password (set_password bumps
+    session_version). That means a single token is effectively one-shot, even though
+    the underlying signing mechanism doesn't enforce one-shot directly.
+    """
+    if not token or not isinstance(token, str) or len(token) > 1024:
+        return None
+    try:
+        data = _invite_serializer().loads(token, max_age=max_age)
+    except (BadSignature, SignatureExpired):
+        return None
+    if not isinstance(data, dict):
+        return None
+    uid = data.get('uid')
+    sv = data.get('sv')
+    if not isinstance(uid, int) or not isinstance(sv, int):
+        return None
+    user = db.session.get(User, uid)
+    if not user:
+        return None
+    if (user.session_version or 1) != sv:
+        return None
+    return user
+
+
+def _invite_new_user(user):
+    """Send an account-activation invitation to a freshly-created user. Idempotent —
+    can be called again as a 'resend invitation' action as long as the user hasn't
+    yet set a password (which would bump session_version and invalidate the token).
+    Returns True if the send succeeded.
+    """
+    token = generate_invite_token(user)
+    setup_url = f"{_site_url()}/setup-account/{token}"
+    try:
+        return send_invitation_email(user, setup_url)
+    except Exception:
+        app.logger.exception(f'Failed to send invitation to {user.email}')
+        return False
+
+
+def _trigger_password_reset(user):
+    """Admin-triggered password reset — generates a regular reset token and emails
+    the standard reset link. Used by the 'Send password reset' button on user-edit pages.
+    """
+    token = generate_reset_token(user)
+    reset_url = f"{_site_url()}/reset-password/{token}"
+    try:
+        return send_password_reset_email(user, reset_url)
+    except Exception:
+        app.logger.exception(f'Failed to send admin-triggered reset to {user.email}')
+        return False
+
+
 # === ROUTES ===
 
 @app.route('/')
@@ -488,14 +676,17 @@ def index():
     return redirect(url_for('login'))
 
 
-def _safe_next(next_page):
-    """Return next_page only if it's a same-origin relative path.
+def _safe_next(next_page, user=None):
+    """Return next_page only if it's a same-origin relative path AND accessible to `user`.
 
     Rejects:
       - absolute URLs (`http://evil`, `https://evil`)
       - protocol-relative URLs (`//evil.com/x`)
       - non-`/`-prefixed paths
       - anything containing a host or scheme component after parsing
+      - admin/org paths the user doesn't have a role for (prevents the post-login bounce
+        where a pharmacy user clicked a bookmarked admin link → lands on their own page
+        with a confusing red "permission denied" flash)
     """
     if not next_page or not isinstance(next_page, str):
         return None
@@ -504,6 +695,12 @@ def _safe_next(next_page):
     parsed = urlparse(next_page)
     if parsed.scheme or parsed.netloc:
         return None
+    if user is not None:
+        path = parsed.path or next_page
+        if path.startswith('/admin') and not user.is_super_admin():
+            return None
+        if path.startswith('/org') and not (user.is_super_admin() or user.is_org_admin()):
+            return None
     return next_page
 
 
@@ -528,7 +725,7 @@ def login():
             # user opted in. Otherwise the cookie is browser-session-only — ideal for shared
             # pharmacy counter PCs.
             session.permanent = remember
-            next_page = _safe_next(request.args.get('next'))
+            next_page = _safe_next(request.args.get('next'), user=user)
             flash(f'Welcome back, {user.name}!', 'success')
             return redirect(next_page or url_for('dashboard'))
         _record_attempt(f'login:{client_ip}')
@@ -561,50 +758,44 @@ def forgot_password():
         user = User.query.filter_by(email=email).first()
         if user:
             token = generate_reset_token(user)
-            site_url = app.config.get('SITE_URL') or request.host_url.rstrip('/')
+            site_url = _site_url()
             reset_url = f"{site_url}/reset-password/{token}"
-
-            safe_user_name = escape(user.name or '')
-            safe_reset_url = escape(reset_url)
-            reset_html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <style>
-        body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
-        .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
-        .header {{ background: linear-gradient(135deg, #00891a, #006913); color: white; padding: 20px; text-align: center; border-radius: 8px 8px 0 0; }}
-        .content {{ background: #f9f9f9; padding: 20px; border-radius: 0 0 8px 8px; }}
-        .btn {{ display: inline-block; background: #00891a; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; margin-top: 15px; }}
-        .footer {{ text-align: center; margin-top: 20px; color: #666; font-size: 12px; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1 style="margin: 0;">Pharmabox24</h1>
-            <p style="margin: 5px 0 0 0;">Password Reset</p>
-        </div>
-        <div class="content">
-            <p>Hello <strong>{safe_user_name}</strong>,</p>
-            <p>You requested a password reset. Click the button below within 1 hour to set a new password:</p>
-            <p style="text-align: center;">
-                <a href="{safe_reset_url}" class="btn">Reset Password</a>
-            </p>
-            <p style="font-size: 12px; color: #666;">If you didn't request this, you can safely ignore this email.</p>
-        </div>
-        <div class="footer">
-            <p>Pharmabox24 - Prescription Collection Analytics Portal</p>
-        </div>
-    </div>
-</body>
-</html>"""
-            send_email(user.email, 'Password Reset - Pharmabox24', reset_html)
+            send_password_reset_email(user, reset_url)
 
         flash('If that email exists in our system, a reset link has been sent.', 'info')
         return redirect(url_for('login'))
 
     return render_template('forgot_password.html', form=form)
+
+
+@app.route('/setup-account/<token>', methods=['GET', 'POST'])
+def setup_account(token):
+    """New-user invitation activation. Verifies the invite token, lets the user set
+    a password, logs them in. Token is invalidated by the password set (session_version bump).
+    """
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+
+    user = verify_invite_token(token)
+    if not user:
+        flash('This invitation link is invalid or has expired. Ask your administrator to resend it.', 'error')
+        return redirect(url_for('login'))
+
+    form = SetupAccountForm()
+    if form.validate_on_submit():
+        if form.new_password.data != form.confirm_password.data:
+            flash('Passwords do not match.', 'error')
+            return render_template('setup_account.html', form=form, token=token, invited_email=user.email)
+
+        user.set_password(form.new_password.data)  # bumps session_version → invalidates token
+        db.session.commit()
+        # Log them in directly so they don't have to re-enter the password they just typed.
+        login_user(user, remember=False)
+        session.permanent = False
+        flash(f'Welcome, {user.name}! Your account is now active.', 'success')
+        return redirect(url_for('dashboard'))
+
+    return render_template('setup_account.html', form=form, token=token, invited_email=user.email)
 
 
 @app.route('/reset-password/<token>', methods=['GET', 'POST'])
@@ -898,7 +1089,6 @@ def org_user_add():
     form = OrgUserForm()
     org_pharmacies = Pharmacy.query.filter_by(organisation_id=current_user.organisation_id).order_by(Pharmacy.name).all()
     form.pharmacy_id.choices = [(0, '-- No Pharmacy --')] + [(p.id, p.name) for p in org_pharmacies]
-    form.password.validators = [DataRequired(), Length(min=_PASSWORD_MIN, max=_PASSWORD_MAX)]
 
     if form.validate_on_submit():
         existing = User.query.filter_by(email=_normalize_email(form.email.data)).first()
@@ -913,10 +1103,19 @@ def org_user_add():
             pharmacy_id=form.pharmacy_id.data if form.pharmacy_id.data != 0 else None,
             organisation_id=current_user.organisation_id
         )
-        user.set_password(form.password.data)
+        # Placeholder random password — user can't log in until they set their own via
+        # the invitation link. The hash is unguessable so the row is safe at rest.
+        user.set_password(secrets.token_urlsafe(32))
         db.session.add(user)
         db.session.commit()
-        flash(f'User "{user.name}" has been created.', 'success')
+
+        if _invite_new_user(user):
+            flash(f'User "{user.name}" has been created. An invitation email has been sent to {user.email}.', 'success')
+        else:
+            flash(
+                f'User "{user.name}" has been created, but the invitation email could not be sent. '
+                'Use the "Send invite" action on the user list to retry.', 'error'
+            )
         return redirect(url_for('org_users'))
     return render_template('org/user_form.html', form=form, title='Add User')
 
@@ -949,14 +1148,46 @@ def org_user_edit(id):
         user.email = new_email
         user.name = form.name.data
         user.pharmacy_id = form.pharmacy_id.data if form.pharmacy_id.data != 0 else None
-        if form.password.data:
-            user.set_password(form.password.data)
+        # Passwords are NOT set from the edit form — use the "Send password reset" or
+        # "Resend invite" actions instead.
         db.session.commit()
         flash(f'User "{user.name}" has been updated.', 'success')
         return redirect(url_for('org_users'))
 
     form.pharmacy_id.data = user.pharmacy_id or 0
     return render_template('org/user_form.html', form=form, title='Edit User', user=user)
+
+
+@app.route('/org/user/<int:id>/send-reset', methods=['POST'])
+@login_required
+def org_user_send_reset(id):
+    if not current_user.is_org_admin():
+        return redirect(url_for('dashboard'))
+    user = User.query.get_or_404(id)
+    org_pharmacy_ids = _get_org_pharmacy_ids()
+    if user.organisation_id != current_user.organisation_id and user.pharmacy_id not in org_pharmacy_ids:
+        abort(403)
+    if _trigger_password_reset(user):
+        flash(f'Password reset email sent to {user.email}.', 'success')
+    else:
+        flash(f'Could not send password reset email to {user.email}. Check Railway logs.', 'error')
+    return redirect(url_for('org_users'))
+
+
+@app.route('/org/user/<int:id>/resend-invite', methods=['POST'])
+@login_required
+def org_user_resend_invite(id):
+    if not current_user.is_org_admin():
+        return redirect(url_for('dashboard'))
+    user = User.query.get_or_404(id)
+    org_pharmacy_ids = _get_org_pharmacy_ids()
+    if user.organisation_id != current_user.organisation_id and user.pharmacy_id not in org_pharmacy_ids:
+        abort(403)
+    if _invite_new_user(user):
+        flash(f'Invitation email re-sent to {user.email}.', 'success')
+    else:
+        flash(f'Could not send invitation to {user.email}. Check Railway logs.', 'error')
+    return redirect(url_for('org_users'))
 
 
 @app.route('/org/user/<int:id>/delete', methods=['POST'])
@@ -1313,7 +1544,6 @@ def admin_user_add():
     form.organisation_id.choices = [(0, '-- No Organisation --')] + [
         (o.id, o.name) for o in Organisation.query.order_by(Organisation.name).all()
     ]
-    form.password.validators = [DataRequired(), Length(min=_PASSWORD_MIN, max=_PASSWORD_MAX)]
 
     if form.validate_on_submit():
         existing = User.query.filter_by(email=_normalize_email(form.email.data)).first()
@@ -1328,10 +1558,18 @@ def admin_user_add():
             pharmacy_id=form.pharmacy_id.data if form.pharmacy_id.data != 0 else None,
             organisation_id=form.organisation_id.data if form.organisation_id.data != 0 else None
         )
-        user.set_password(form.password.data)
+        # Placeholder random password — invitation flow makes the user set their own.
+        user.set_password(secrets.token_urlsafe(32))
         db.session.add(user)
         db.session.commit()
-        flash(f'User "{user.name}" has been created.', 'success')
+
+        if _invite_new_user(user):
+            flash(f'User "{user.name}" has been created. An invitation email has been sent to {user.email}.', 'success')
+        else:
+            flash(
+                f'User "{user.name}" has been created, but the invitation email could not be sent. '
+                'Use the "Send invite" action on the user list to retry.', 'error'
+            )
         return redirect(url_for('admin_users'))
     return render_template('admin/user_form.html', form=form, title='Add User')
 
@@ -1364,8 +1602,7 @@ def admin_user_edit(id):
         user.role = form.role.data
         user.pharmacy_id = form.pharmacy_id.data if form.pharmacy_id.data != 0 else None
         user.organisation_id = form.organisation_id.data if form.organisation_id.data != 0 else None
-        if form.password.data:
-            user.set_password(form.password.data)
+        # Passwords are not set from this form. Use "Send password reset" or "Resend invite".
         db.session.commit()
         flash(f'User "{user.name}" has been updated.', 'success')
         return redirect(url_for('admin_users'))
@@ -1373,6 +1610,30 @@ def admin_user_edit(id):
     form.pharmacy_id.data = user.pharmacy_id or 0
     form.organisation_id.data = user.organisation_id or 0
     return render_template('admin/user_form.html', form=form, title='Edit User', user=user)
+
+
+@app.route('/admin/user/<int:id>/send-reset', methods=['POST'])
+@login_required
+@super_admin_required
+def admin_user_send_reset(id):
+    user = User.query.get_or_404(id)
+    if _trigger_password_reset(user):
+        flash(f'Password reset email sent to {user.email}.', 'success')
+    else:
+        flash(f'Could not send password reset email to {user.email}. Check Railway logs.', 'error')
+    return redirect(url_for('admin_users'))
+
+
+@app.route('/admin/user/<int:id>/resend-invite', methods=['POST'])
+@login_required
+@super_admin_required
+def admin_user_resend_invite(id):
+    user = User.query.get_or_404(id)
+    if _invite_new_user(user):
+        flash(f'Invitation email re-sent to {user.email}.', 'success')
+    else:
+        flash(f'Could not send invitation to {user.email}. Check Railway logs.', 'error')
+    return redirect(url_for('admin_users'))
 
 
 @app.route('/admin/user/<int:id>/delete', methods=['POST'])
