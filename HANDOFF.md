@@ -172,8 +172,12 @@ From the original audit, ranked by ROI:
 
 If you ever clone fresh and find `requirements.txt`/`runtime.txt` missing but `requirements.md`/`runtime.md` present: that's Dropbox interference. Run `git checkout HEAD -- requirements.txt runtime.txt` to restore them.
 
-### 5.2 Tailwind CDN ≠ static CDN
-`cdn.tailwindcss.com` is a **runtime JIT compiler** that serves different bytes per browser. Do NOT add SRI to it (it'll always fail). Either tolerate the supply-chain risk or self-host (#15 in § 4.2). SRI is in place for the other three CDN scripts.
+### 5.2 CDN scripts and SRI — all hashes dropped
+- `cdn.tailwindcss.com` is a **runtime JIT compiler** that serves different bytes per browser. SRI was never going to work here.
+- `cdn.jsdelivr.net/...` (Chart.js, formerly Alpine) and `cdnjs.cloudflare.com` (Font Awesome) also failed SRI in practice — the hashes computed via curl didn't match what browsers actually received. Both serve `Cache-Control: immutable`, which pins a failed-SRI state in the browser even through Cmd+Shift+R.
+- **All SRI removed**, all `crossorigin="anonymous"` attributes dropped (they were paired with the removed integrity attrs).
+- **Alpine.js was removed entirely** — it was only used in one place (the user-menu dropdown in base.html). Replaced with 12 lines of inline vanilla JS at the bottom of `<body>`. One fewer CDN dependency, one fewer supply-chain attack surface.
+- Tailwind, Chart.js, Font Awesome remain on CDN. Self-hosting them is the proper fix (#15 in § 4.2) — requires an npm/PostCSS build pipeline on Railway.
 
 ### 5.3 Init_db is log-and-continue
 The audit recommendation was "fail loudly on init errors." We tried that and a UniqueViolation on admin-sync crashed every worker on deploy. Current behaviour: log full traceback to Railway, keep workers serving. Trade-off: bad migration could silently leave the app running against a half-migrated schema. The migration steps are all idempotent (`IF NOT EXISTS`) so this is acceptable.
@@ -186,6 +190,16 @@ Per § 2.1. Resolve manually via `/admin/users`.
 
 ### 5.6 Backup service
 Separate Railway service running `backup/backup.py` on a cron (`0 2 * * *` UTC). Stores `.sql.gz` files on a `/data` volume, retains 7 days. Notifies via Resend if configured (`BACKUP_NOTIFY_EMAIL`). The script no longer uses `shell=True`; pg_dump is called via `subprocess.Popen` with libpq env vars piped to `gzip.open()` in Python.
+
+### 5.7 Gmail shows a WordPress "W" icon next to outgoing emails
+Not coming from our HTML — it's Gmail's **sender-avatar lookup**. Gmail builds the circular avatar next to the sender name by checking Gravatar.com for the `From:` address. The `pharmabox24.co.uk` apex domain runs WordPress, and WordPress auto-registers Gravatar profiles for its admin emails (often `admin@`, `info@`, `noreply@`) using a WP-themed default avatar. Gmail finds that and displays it.
+
+**Three fixes (pick one):**
+1. **Set a real Gravatar for the sender address** (free, ~5 min). Sign up at gravatar.com using the exact address in `MAIL_FROM`, upload the Pharmabox24 logo. Propagates within a few hours. Works across Gmail, Apple Mail, Outlook.com (partially), WordPress comments, GitHub.
+2. **Switch `MAIL_FROM` to a local-part with no Gravatar history** (free, instant). E.g. `notifications@`, `alerts@`, `dashboard@`. Gmail falls back to a colored "P" initial, which looks fine.
+3. **BIMI** (Brand Indicators for Message Identification) — proper verified-logo solution. Requires DMARC at p=quarantine/reject, hosted SVG logo, and a VMC (Verified Mark Certificate, ~$1,500/yr). Heavyweight; only worth it if email branding is strategic. Not now.
+
+**Recommendation:** option 1 if you own `noreply@pharmabox24.co.uk` (or whatever's in MAIL_FROM) and can verify it on Gravatar. Otherwise option 2.
 
 ---
 
