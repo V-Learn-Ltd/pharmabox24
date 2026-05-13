@@ -1055,9 +1055,6 @@ def admin_dashboard():
                          recent_uploads=recent_uploads)
 
 
-@app.route('/admin/upload', methods=['GET', 'POST'])
-@login_required
-@super_admin_required
 def _verify_upload_signature(filepath, original_name):
     """Magic-byte check on the saved upload — defends against extension spoofing.
 
@@ -1083,6 +1080,9 @@ def _verify_upload_signature(filepath, original_name):
     raise ValueError('Unsupported file extension')
 
 
+@app.route('/admin/upload', methods=['GET', 'POST'])
+@login_required
+@super_admin_required
 def admin_upload():
     form = UploadForm()
     uploads = Upload.query.order_by(Upload.uploaded_at.desc()).limit(20).all()
@@ -2022,6 +2022,13 @@ def init_db():
             admin_email = os.environ.get('ADMIN_EMAIL', 'admin@pharmabox24.com').strip().lower()
             admin_password = os.environ.get('ADMIN_PASSWORD', '').strip()
 
+            # Admin sync logic — pick the row in priority order:
+            #   1. user matching ADMIN_EMAIL exactly (treat as the canonical admin)
+            #   2. otherwise, any existing super_admin
+            #   3. otherwise, create a new super_admin with ADMIN_EMAIL
+            # We never reassign emails between rows — if ADMIN_EMAIL belongs to a non-admin
+            # user and a separate super_admin exists, we leave both alone and warn loudly.
+            user_by_email = User.query.filter_by(email=admin_email).first()
             existing_super = User.query.filter_by(role='super_admin').first()
 
             if admin_password:
@@ -2030,19 +2037,42 @@ def init_db():
                         f'ADMIN_PASSWORD is shorter than {_PASSWORD_MIN} characters — refusing to sync admin.'
                     )
                 else:
-                    admin = existing_super or User.query.filter_by(email=admin_email).first()
-                    if admin:
-                        admin.email = admin_email
-                        admin.role = 'super_admin'
-                        admin.set_password(admin_password)
-                        db.session.commit()
-                        app.logger.info(f'Super admin credentials synced: {admin_email}')
-                    else:
-                        admin = User(email=admin_email, name='Administrator', role='super_admin')
-                        admin.set_password(admin_password)
-                        db.session.add(admin)
-                        db.session.commit()
-                        app.logger.info(f'Created super admin user: {admin_email}')
+                    try:
+                        if user_by_email is not None:
+                            # ADMIN_EMAIL row exists. Promote to super_admin and sync password.
+                            user_by_email.role = 'super_admin'
+                            user_by_email.set_password(admin_password)
+                            db.session.commit()
+                            app.logger.info(f'Super admin credentials synced for {admin_email}')
+                            if existing_super and existing_super.id != user_by_email.id:
+                                app.logger.warning(
+                                    f'Another super_admin row exists (id={existing_super.id}, '
+                                    f'email={existing_super.email!r}). Two super_admins are now active; '
+                                    'reconcile via /admin/users if unintended.'
+                                )
+                        elif existing_super is not None:
+                            # No row with ADMIN_EMAIL, but a super_admin exists under a different
+                            # email. DO NOT rename it — renaming risks unique-constraint clashes
+                            # against other users. Just sync the password under the existing email.
+                            if existing_super.email != admin_email:
+                                app.logger.warning(
+                                    f'ADMIN_EMAIL env var is {admin_email!r} but the active super_admin '
+                                    f'has email {existing_super.email!r}. Password synced under the existing '
+                                    'email; update ADMIN_EMAIL to match, or rename the user manually.'
+                                )
+                            existing_super.set_password(admin_password)
+                            db.session.commit()
+                            app.logger.info(f'Super admin password synced (id={existing_super.id})')
+                        else:
+                            # No admin at all — create one from env.
+                            admin = User(email=admin_email, name='Administrator', role='super_admin')
+                            admin.set_password(admin_password)
+                            db.session.add(admin)
+                            db.session.commit()
+                            app.logger.info(f'Created super admin user: {admin_email}')
+                    except Exception:
+                        db.session.rollback()
+                        app.logger.exception('Admin sync failed — leaving existing rows untouched')
             else:
                 if not existing_super and os.environ.get('PHARMABOX_ENV') != 'development':
                     # Hard-fail: never auto-create a default-credential admin in production.
