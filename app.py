@@ -1,22 +1,33 @@
 import os
 import json
-import secrets
+import time
+import uuid
+import zipfile
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta, date
 from functools import wraps
-from hashlib import sha256
+from threading import Lock
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
-from urllib.error import URLError
+from urllib.error import URLError, HTTPError
 
-from flask import Flask, render_template, redirect, url_for, flash, request, jsonify, abort
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover — Python < 3.9
+    ZoneInfo = None
+
+from flask import Flask, render_template, redirect, url_for, flash, request, jsonify, abort, session
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
 from flask_wtf import FlaskForm, CSRFProtect
 from flask_wtf.csrf import CSRFError
 from flask_wtf.file import FileField, FileRequired, FileAllowed
 from wtforms import StringField, PasswordField, SelectField, EmailField
 from wtforms.validators import DataRequired, Email, Length, EqualTo, Optional
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
+from markupsafe import escape
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from openpyxl import load_workbook
 import csv
 
@@ -28,45 +39,106 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config.from_object(Config)
 
+# Honour X-Forwarded-* headers from the trusted proxy depth in front of us (Railway = 1).
+app.wsgi_app = ProxyFix(
+    app.wsgi_app,
+    x_for=app.config['TRUSTED_PROXY_COUNT'],
+    x_proto=app.config['TRUSTED_PROXY_COUNT'],
+    x_host=app.config['TRUSTED_PROXY_COUNT'],
+)
+
 db.init_app(app)
 csrf = CSRFProtect(app)
 login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = 'login'
 login_manager.login_message = 'Please log in to access this page.'
+login_manager.session_protection = 'strong'
 
 
 @app.errorhandler(CSRFError)
 def csrf_error(e):
     flash('Your session expired. Please try again.', 'error')
-    return redirect(request.url)
+    # Redirect to a fixed safe destination — never reflect request.url back.
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+    return redirect(url_for('login'))
 
 # Ensure upload folder exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# Simple in-memory rate limiter for login/forgot-password
+# Simple in-memory rate limiter for login/forgot-password.
+# NOTE: this is PER-WORKER. With gunicorn --workers N, effective limit is N × _MAX_ATTEMPTS.
+# Acceptable as a layered control alongside strong passwords and account lockout; replace with
+# Flask-Limiter + Redis once that infrastructure is available.
 _login_attempts = defaultdict(list)
-_MAX_ATTEMPTS = 10
-_WINDOW_SECONDS = 300  # 5 minutes
+_attempts_lock = Lock()
+_MAX_ATTEMPTS = 5            # Per-IP per worker, per window
+_WINDOW_SECONDS = 300        # 5 minutes
+_MAX_TRACKED_KEYS = 5000     # Hard cap to prevent memory exhaustion
+
+
+def _client_ip():
+    """Return the client IP, trusting only as many proxies as TRUSTED_PROXY_COUNT permits."""
+    # ProxyFix has already rewritten request.remote_addr based on TRUSTED_PROXY_COUNT.
+    return request.remote_addr or 'unknown'
 
 
 def _is_rate_limited(key):
-    """Check if key has exceeded rate limit. Cleans old entries."""
-    now = datetime.now().timestamp()
-    _login_attempts[key] = [t for t in _login_attempts[key] if now - t < _WINDOW_SECONDS]
-    return len(_login_attempts[key]) >= _MAX_ATTEMPTS
+    """Check if key has exceeded rate limit. Cleans old entries; bounded memory."""
+    now = time.time()
+    with _attempts_lock:
+        attempts = [t for t in _login_attempts.get(key, ()) if now - t < _WINDOW_SECONDS]
+        if attempts:
+            _login_attempts[key] = attempts
+        elif key in _login_attempts:
+            del _login_attempts[key]
+
+        # Periodic janitor — purge cold keys when the dict grows
+        if len(_login_attempts) > _MAX_TRACKED_KEYS:
+            cutoff = now - _WINDOW_SECONDS
+            stale = [k for k, ts in _login_attempts.items() if not ts or ts[-1] < cutoff]
+            for k in stale:
+                _login_attempts.pop(k, None)
+
+        return len(attempts) >= _MAX_ATTEMPTS
 
 
 def _record_attempt(key):
-    _login_attempts[key].append(datetime.now().timestamp())
+    with _attempts_lock:
+        _login_attempts[key].append(time.time())
+
+
+_CSP = (
+    "default-src 'self'; "
+    # 'unsafe-inline' is required for the inline tailwind config block in base.html.
+    # Migrate to a nonce when templates are refactored or Tailwind is compiled at build time.
+    "script-src 'self' 'unsafe-inline' "
+    "https://cdn.jsdelivr.net https://cdn.tailwindcss.com https://cdnjs.cloudflare.com; "
+    "style-src 'self' 'unsafe-inline' "
+    "https://cdnjs.cloudflare.com https://cdn.tailwindcss.com; "
+    "img-src 'self' data:; "
+    "font-src 'self' data: https://cdnjs.cloudflare.com; "
+    "connect-src 'self'; "
+    "frame-ancestors 'self'; "
+    "base-uri 'self'; "
+    "form-action 'self'; "
+    "object-src 'none'"
+)
 
 
 @app.after_request
 def set_security_headers(response):
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'SAMEORIGIN'
-    response.headers['X-XSS-Protection'] = '1; mode=block'
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=(), payment=()'
+    response.headers['Content-Security-Policy'] = _CSP
+    # Only emit HSTS over HTTPS — avoid pinning HTTP-only dev hosts.
+    if request.is_secure:
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    # X-XSS-Protection is deprecated and can introduce vulnerabilities — do not set it.
+    response.headers.pop('X-XSS-Protection', None)
     return response
 
 
@@ -77,39 +149,87 @@ def send_email(to_email, subject, html_content):
         app.logger.warning('RESEND_API_KEY not configured - skipping email')
         return False
 
+    payload = json.dumps({
+        'from': app.config['MAIL_FROM'],
+        'to': [to_email],
+        'subject': subject,
+        'html': html_content
+    }).encode()
+
+    req = Request(
+        'https://api.resend.com/emails',
+        data=payload,
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json'
+        },
+        method='POST'
+    )
+
     try:
-        payload = json.dumps({
-            'from': app.config['MAIL_FROM'],
-            'to': [to_email],
-            'subject': subject,
-            'html': html_content
-        }).encode()
-
-        req = Request(
-            'https://api.resend.com/emails',
-            data=payload,
-            headers={
-                'Authorization': f'Bearer {api_key}',
-                'Content-Type': 'application/json'
-            },
-            method='POST'
-        )
-        urlopen(req, timeout=10)
-        app.logger.info(f'Email sent to {to_email}')
-        return True
-
-    except (URLError, Exception) as e:
-        app.logger.error(f'Failed to send email to {to_email}: {str(e)}')
+        with urlopen(req, timeout=10) as resp:
+            if 200 <= resp.status < 300:
+                app.logger.info(f'Email sent to {to_email} (status {resp.status})')
+                return True
+            app.logger.error(f'Resend returned status {resp.status} for {to_email}')
+            return False
+    except HTTPError as e:
+        body = ''
+        try:
+            body = e.read().decode('utf-8', errors='replace')[:500]
+        except Exception:
+            pass
+        app.logger.error(f'Resend HTTPError {e.code} sending to {to_email}: {body}')
         return False
+    except (URLError, TimeoutError) as e:
+        app.logger.error(f'Resend network error sending to {to_email}: {e}')
+        return False
+    except (ValueError, OSError) as e:
+        app.logger.exception(f'Unexpected error sending to {to_email}: {e}')
+        return False
+
+
+def _safe_int(value, default=0):
+    """Coerce a value to int safely for email/template use."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _today():
+    """Return today's date in the configured display timezone (Europe/Dublin by default)."""
+    tz_name = app.config.get('DISPLAY_TIMEZONE') or 'Europe/Dublin'
+    if ZoneInfo is None:
+        return date.today()
+    try:
+        return datetime.now(ZoneInfo(tz_name)).date()
+    except Exception:
+        return date.today()
+
+
+def _normalize_email(value):
+    """Strip whitespace and lower-case an email; bound length to model column size."""
+    if not value:
+        return ''
+    return (value or '').strip().lower()[:120]
 
 
 def send_notification_email(pharmacy, stats_summary):
-    """Send email notification to pharmacy about new data upload"""
+    """Send email notification to pharmacy about new data upload."""
     if not pharmacy.notification_email:
         return False
 
-    site_url = app.config.get('SITE_URL', request.host_url.rstrip('/'))
+    site_url = app.config.get('SITE_URL') or request.host_url.rstrip('/')
     login_url = f"{site_url}/login"
+
+    # Every user-controlled value is HTML-escaped before interpolation. Pharmacy names
+    # originate from uploaded spreadsheets and must NEVER be trusted as HTML.
+    safe_name = escape(pharmacy.name or '')
+    loaded = _safe_int(stats_summary.get('loaded'))
+    collected = _safe_int(stats_summary.get('collected'))
+    removed = _safe_int(stats_summary.get('removed'))
+    safe_login = escape(login_url)
 
     html_content = f"""
 <!DOCTYPE html>
@@ -133,24 +253,24 @@ def send_notification_email(pharmacy, stats_summary):
             <p style="margin: 5px 0 0 0;">New Statistics Available</p>
         </div>
         <div class="content">
-            <p>Hello <strong>{pharmacy.name}</strong>,</p>
+            <p>Hello <strong>{safe_name}</strong>,</p>
             <p>New statistics have been uploaded for your pharmacy. Here's a quick summary:</p>
 
             <div class="stats-card">
                 <div>Loaded Parcels</div>
-                <div class="stat-value">{stats_summary.get('loaded', 0)}</div>
+                <div class="stat-value">{loaded}</div>
             </div>
             <div class="stats-card">
                 <div>Collected Parcels</div>
-                <div class="stat-value">{stats_summary.get('collected', 0)}</div>
+                <div class="stat-value">{collected}</div>
             </div>
             <div class="stats-card">
                 <div>Removed Parcels</div>
-                <div class="stat-value">{stats_summary.get('removed', 0)}</div>
+                <div class="stat-value">{removed}</div>
             </div>
 
             <p style="text-align: center;">
-                <a href="{login_url}" class="btn">View Full Analytics</a>
+                <a href="{safe_login}" class="btn">View Full Analytics</a>
             </p>
         </div>
         <div class="footer">
@@ -160,16 +280,56 @@ def send_notification_email(pharmacy, stats_summary):
 </body>
 </html>"""
 
+    # Subject lines also surface user-controlled values — neutralise newlines/control chars.
+    safe_subject_name = (pharmacy.name or '').replace('\r', ' ').replace('\n', ' ')[:120]
     return send_email(
         pharmacy.notification_email,
-        f'New Statistics Available - {pharmacy.name}',
+        f'New Statistics Available - {safe_subject_name}',
         html_content
     )
 
 
+def send_password_changed_notice(user):
+    """Out-of-band notification when a user's password is changed."""
+    if not user.email:
+        return False
+    safe_name = escape(user.name or '')
+    html = f"""
+<!DOCTYPE html>
+<html><body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+<p>Hello <strong>{safe_name}</strong>,</p>
+<p>Your Pharmabox24 password was just changed. If this wasn't you, contact your administrator immediately.</p>
+<p style="font-size: 12px; color: #666;">Pharmabox24 — Prescription Collection Analytics Portal</p>
+</body></html>"""
+    return send_email(user.email, 'Pharmabox24 password changed', html)
+
+
 @login_manager.user_loader
 def load_user(user_id):
-    return db.session.get(User, int(user_id))
+    """Tolerate both legacy raw-int IDs and the new id|session_version format."""
+    if user_id is None:
+        return None
+    raw = str(user_id)
+    pinned_version = None
+    if '|' in raw:
+        raw_id, _, ver = raw.partition('|')
+        try:
+            pinned_version = int(ver)
+        except ValueError:
+            return None
+    else:
+        raw_id = raw
+    try:
+        uid = int(raw_id)
+    except ValueError:
+        return None
+    user = db.session.get(User, uid)
+    if not user:
+        return None
+    # If the cookie was issued before a force-logout / password change, reject it.
+    if pinned_version is not None and (user.session_version or 1) != pinned_version:
+        return None
+    return user
 
 
 # --- Decorators ---
@@ -220,10 +380,14 @@ class LoginForm(FlaskForm):
     password = PasswordField('Password', validators=[DataRequired()])
 
 
+_PASSWORD_MIN = 12
+_PASSWORD_MAX = 128
+
+
 class UserForm(FlaskForm):
     email = EmailField('Email', validators=[DataRequired(), Email()])
     name = StringField('Name', validators=[DataRequired(), Length(min=2, max=100)])
-    password = PasswordField('Password', validators=[Length(min=6, max=100)])
+    password = PasswordField('Password', validators=[Length(min=_PASSWORD_MIN, max=_PASSWORD_MAX)])
     role = SelectField('Role', choices=[('pharmacy', 'Pharmacy User'), ('org_admin', 'Organisation Admin'), ('super_admin', 'Super Admin')])
     pharmacy_id = SelectField('Pharmacy', coerce=int)
     organisation_id = SelectField('Organisation', coerce=int)
@@ -233,7 +397,7 @@ class OrgUserForm(FlaskForm):
     """User form for org admins — can only create pharmacy users within their org."""
     email = EmailField('Email', validators=[DataRequired(), Email()])
     name = StringField('Name', validators=[DataRequired(), Length(min=2, max=100)])
-    password = PasswordField('Password', validators=[Length(min=6, max=100)])
+    password = PasswordField('Password', validators=[Length(min=_PASSWORD_MIN, max=_PASSWORD_MAX)])
     pharmacy_id = SelectField('Pharmacy', coerce=int)
 
 
@@ -257,7 +421,7 @@ class UploadForm(FlaskForm):
 
 class ChangePasswordForm(FlaskForm):
     current_password = PasswordField('Current Password', validators=[DataRequired()])
-    new_password = PasswordField('New Password', validators=[DataRequired(), Length(min=6, max=100)])
+    new_password = PasswordField('New Password', validators=[DataRequired(), Length(min=_PASSWORD_MIN, max=_PASSWORD_MAX)])
     confirm_password = PasswordField('Confirm New Password', validators=[DataRequired()])
 
 
@@ -266,42 +430,48 @@ class ForgotPasswordForm(FlaskForm):
 
 
 class ResetPasswordForm(FlaskForm):
-    new_password = PasswordField('New Password', validators=[DataRequired(), Length(min=6, max=100)])
+    new_password = PasswordField('New Password', validators=[DataRequired(), Length(min=_PASSWORD_MIN, max=_PASSWORD_MAX)])
     confirm_password = PasswordField('Confirm Password', validators=[DataRequired()])
 
 
-# Password reset token helpers
+# Password reset token helpers — HMAC-signed via itsdangerous, bound to the user's
+# session_version so any password change or forced logout invalidates outstanding tokens.
+
+_RESET_SALT = 'pharmabox-password-reset-v2'
+
+
+def _reset_serializer():
+    return URLSafeTimedSerializer(app.config['SECRET_KEY'], salt=_RESET_SALT)
+
+
 def generate_reset_token(user):
-    """Generate a time-limited password reset token"""
-    timestamp = int(datetime.now().timestamp())
-    raw = f"{user.id}:{user.password_hash}:{timestamp}:{app.config['SECRET_KEY']}"
-    signature = sha256(raw.encode()).hexdigest()[:32]
-    return f"{user.id}:{timestamp}:{signature}"
+    return _reset_serializer().dumps({
+        'uid': user.id,
+        'sv': user.session_version or 1,
+    })
 
 
 def verify_reset_token(token, max_age=3600):
-    """Verify a password reset token (default 1 hour expiry)"""
-    try:
-        parts = token.split(':')
-        if len(parts) != 3:
-            return None
-        user_id, timestamp, signature = int(parts[0]), int(parts[1]), parts[2]
-
-        if datetime.now().timestamp() - timestamp > max_age:
-            return None
-
-        user = db.session.get(User, user_id)
-        if not user:
-            return None
-
-        raw = f"{user.id}:{user.password_hash}:{timestamp}:{app.config['SECRET_KEY']}"
-        expected = sha256(raw.encode()).hexdigest()[:32]
-        if not secrets.compare_digest(signature, expected):
-            return None
-
-        return user
-    except (ValueError, TypeError):
+    """Verify a password-reset token. Returns the User or None."""
+    if not token or not isinstance(token, str) or len(token) > 1024:
         return None
+    try:
+        data = _reset_serializer().loads(token, max_age=max_age)
+    except (BadSignature, SignatureExpired):
+        return None
+    if not isinstance(data, dict):
+        return None
+    uid = data.get('uid')
+    sv = data.get('sv')
+    if not isinstance(uid, int) or not isinstance(sv, int):
+        return None
+    user = db.session.get(User, uid)
+    if not user:
+        return None
+    # session_version changes on password reset → outstanding tokens stop working.
+    if (user.session_version or 1) != sv:
+        return None
+    return user
 
 
 # === ROUTES ===
@@ -313,6 +483,25 @@ def index():
     return redirect(url_for('login'))
 
 
+def _safe_next(next_page):
+    """Return next_page only if it's a same-origin relative path.
+
+    Rejects:
+      - absolute URLs (`http://evil`, `https://evil`)
+      - protocol-relative URLs (`//evil.com/x`)
+      - non-`/`-prefixed paths
+      - anything containing a host or scheme component after parsing
+    """
+    if not next_page or not isinstance(next_page, str):
+        return None
+    if not next_page.startswith('/') or next_page.startswith('//'):
+        return None
+    parsed = urlparse(next_page)
+    if parsed.scheme or parsed.netloc:
+        return None
+    return next_page
+
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if current_user.is_authenticated:
@@ -320,17 +509,17 @@ def login():
 
     form = LoginForm()
     if form.validate_on_submit():
-        client_ip = request.remote_addr or 'unknown'
+        client_ip = _client_ip()
         if _is_rate_limited(f'login:{client_ip}'):
             flash('Too many login attempts. Please wait a few minutes.', 'error')
             return render_template('login.html', form=form)
 
-        user = User.query.filter_by(email=form.email.data.lower()).first()
+        email = (form.email.data or '').strip().lower()
+        user = User.query.filter_by(email=email).first()
         if user and user.check_password(form.password.data):
             login_user(user, remember=True)
-            next_page = request.args.get('next')
-            if next_page and not next_page.startswith('/'):
-                next_page = None
+            session.permanent = True
+            next_page = _safe_next(request.args.get('next'))
             flash(f'Welcome back, {user.name}!', 'success')
             return redirect(next_page or url_for('dashboard'))
         _record_attempt(f'login:{client_ip}')
@@ -338,7 +527,7 @@ def login():
     return render_template('login.html', form=form)
 
 
-@app.route('/logout')
+@app.route('/logout', methods=['POST'])
 @login_required
 def logout():
     logout_user()
@@ -353,18 +542,21 @@ def forgot_password():
 
     form = ForgotPasswordForm()
     if form.validate_on_submit():
-        client_ip = request.remote_addr or 'unknown'
+        client_ip = _client_ip()
         if _is_rate_limited(f'reset:{client_ip}'):
             flash('Too many reset requests. Please wait a few minutes.', 'error')
             return redirect(url_for('login'))
         _record_attempt(f'reset:{client_ip}')
 
-        user = User.query.filter_by(email=form.email.data.lower()).first()
+        email = (form.email.data or '').strip().lower()
+        user = User.query.filter_by(email=email).first()
         if user:
             token = generate_reset_token(user)
-            site_url = app.config.get('SITE_URL', request.host_url.rstrip('/'))
+            site_url = app.config.get('SITE_URL') or request.host_url.rstrip('/')
             reset_url = f"{site_url}/reset-password/{token}"
 
+            safe_user_name = escape(user.name or '')
+            safe_reset_url = escape(reset_url)
             reset_html = f"""
 <!DOCTYPE html>
 <html>
@@ -385,10 +577,10 @@ def forgot_password():
             <p style="margin: 5px 0 0 0;">Password Reset</p>
         </div>
         <div class="content">
-            <p>Hello <strong>{user.name}</strong>,</p>
+            <p>Hello <strong>{safe_user_name}</strong>,</p>
             <p>You requested a password reset. Click the button below within 1 hour to set a new password:</p>
             <p style="text-align: center;">
-                <a href="{reset_url}" class="btn">Reset Password</a>
+                <a href="{safe_reset_url}" class="btn">Reset Password</a>
             </p>
             <p style="font-size: 12px; color: #666;">If you didn't request this, you can safely ignore this email.</p>
         </div>
@@ -422,8 +614,12 @@ def reset_password(token):
             flash('Passwords do not match.', 'error')
             return render_template('reset_password.html', form=form, token=token)
 
-        user.set_password(form.new_password.data)
+        user.set_password(form.new_password.data)  # bumps session_version → invalidates other sessions
         db.session.commit()
+        try:
+            send_password_changed_notice(user)
+        except Exception:
+            app.logger.exception('Failed to send password-changed notice')
         flash('Your password has been reset. Please log in.', 'success')
         return redirect(url_for('login'))
 
@@ -444,8 +640,15 @@ def change_password():
             flash('New passwords do not match.', 'error')
             return render_template('change_password.html', form=form)
 
-        current_user.set_password(form.new_password.data)
+        current_user.set_password(form.new_password.data)  # bumps session_version
         db.session.commit()
+        try:
+            send_password_changed_notice(current_user)
+        except Exception:
+            app.logger.exception('Failed to send password-changed notice')
+        # The session_version bump just invalidated this session — re-login the user with the
+        # new identifier so they don't get bounced to the login screen.
+        login_user(current_user, remember=True)
         flash('Your password has been updated successfully.', 'success')
         return redirect(url_for('dashboard'))
 
@@ -481,7 +684,7 @@ def pharmacy_dashboard():
         return render_template('pharmacy/dashboard.html', pharmacy=None, stats={})
 
     pharmacy = db.session.get(Pharmacy, current_user.pharmacy_id)
-    today = date.today()
+    today = _today()
     stats = get_pharmacy_stats(pharmacy.id, today)
 
     return render_template('pharmacy/dashboard.html', pharmacy=pharmacy, stats=stats)
@@ -502,7 +705,7 @@ def pharmacy_chart_data():
     if current_user.is_org_admin() and not _can_access_pharmacy(pharmacy_id):
         return jsonify({'error': 'Access denied'}), 403
 
-    today = date.today()
+    today = _today()
     thirty_days_ago = today - timedelta(days=30)
 
     daily_data = DailyStat.query.filter(
@@ -536,16 +739,17 @@ def pharmacy_chart_data():
         dow_loaded.append(round(day_of_week[i]['loaded'] / count, 1))
         dow_collected.append(round(day_of_week[i]['collected'] / count, 1))
 
-    hourly_data = HourlyDistribution.query.filter(
-        HourlyDistribution.pharmacy_id == pharmacy_id
-    ).order_by(HourlyDistribution.month.desc()).all()
-
+    # Pull the latest month only — avoids scanning years of hourly rows for a 4-bucket chart.
+    latest_month = db.session.query(db.func.max(HourlyDistribution.month))\
+        .filter(HourlyDistribution.pharmacy_id == pharmacy_id).scalar()
     hourly_by_period = {}
-    if hourly_data:
-        latest_month = hourly_data[0].month
+    if latest_month is not None:
+        hourly_data = HourlyDistribution.query.filter(
+            HourlyDistribution.pharmacy_id == pharmacy_id,
+            HourlyDistribution.month == latest_month,
+        ).all()
         for h in hourly_data:
-            if h.month == latest_month:
-                hourly_by_period[h.period] = h.collected_parcels
+            hourly_by_period[h.period] = h.collected_parcels
 
     period_order = ['00-08', '08-12', '12-18', '18-24']
     hourly_labels = ['00:00-08:00', '08:00-12:00', '12:00-18:00', '18:00-24:00']
@@ -587,7 +791,7 @@ def org_dashboard():
         return redirect(url_for('dashboard'))
 
     pharmacies = Pharmacy.query.filter_by(organisation_id=org.id).order_by(Pharmacy.name).all()
-    today = date.today()
+    today = _today()
 
     pharmacy_ids = [p.id for p in pharmacies]
 
@@ -650,7 +854,7 @@ def org_pharmacy_view(id):
     if pharmacy.organisation_id != current_user.organisation_id:
         abort(403)
 
-    today = date.today()
+    today = _today()
     stats = get_pharmacy_stats(pharmacy.id, today)
     return render_template('org/pharmacy_view.html', pharmacy=pharmacy, stats=stats)
 
@@ -681,16 +885,16 @@ def org_user_add():
     form = OrgUserForm()
     org_pharmacies = Pharmacy.query.filter_by(organisation_id=current_user.organisation_id).order_by(Pharmacy.name).all()
     form.pharmacy_id.choices = [(0, '-- No Pharmacy --')] + [(p.id, p.name) for p in org_pharmacies]
-    form.password.validators = [DataRequired(), Length(min=6, max=100)]
+    form.password.validators = [DataRequired(), Length(min=_PASSWORD_MIN, max=_PASSWORD_MAX)]
 
     if form.validate_on_submit():
-        existing = User.query.filter_by(email=form.email.data.lower()).first()
+        existing = User.query.filter_by(email=_normalize_email(form.email.data)).first()
         if existing:
             flash('A user with that email already exists.', 'error')
             return render_template('org/user_form.html', form=form, title='Add User')
 
         user = User(
-            email=form.email.data.lower(),
+            email=_normalize_email(form.email.data),
             name=form.name.data,
             role='pharmacy',
             pharmacy_id=form.pharmacy_id.data if form.pharmacy_id.data != 0 else None,
@@ -721,7 +925,7 @@ def org_user_edit(id):
     form.pharmacy_id.choices = [(0, '-- No Pharmacy --')] + [(p.id, p.name) for p in org_pharmacies]
 
     if form.validate_on_submit():
-        new_email = form.email.data.lower()
+        new_email = _normalize_email(form.email.data)
         if new_email != user.email:
             existing = User.query.filter_by(email=new_email).first()
             if existing:
@@ -758,6 +962,17 @@ def org_user_delete(id):
     if user.organisation_id != current_user.organisation_id and user.pharmacy_id not in org_pharmacy_ids:
         abort(403)
 
+    # Refuse to leave the organisation with no org_admin.
+    if user.role == 'org_admin':
+        remaining = User.query.filter(
+            User.role == 'org_admin',
+            User.organisation_id == current_user.organisation_id,
+            User.id != user.id,
+        ).count()
+        if remaining < 1:
+            flash('Cannot delete the last organisation admin. Promote another user first.', 'error')
+            return redirect(url_for('org_users'))
+
     db.session.delete(user)
     db.session.commit()
     flash(f'User "{user.name}" has been deleted.', 'success')
@@ -771,7 +986,7 @@ def org_user_delete(id):
 @super_admin_required
 def admin_dashboard():
     pharmacies = Pharmacy.query.all()
-    today = date.today()
+    today = _today()
 
     total_pharmacies = len(pharmacies)
 
@@ -831,24 +1046,61 @@ def admin_dashboard():
 @app.route('/admin/upload', methods=['GET', 'POST'])
 @login_required
 @super_admin_required
+def _verify_upload_signature(filepath, original_name):
+    """Magic-byte check on the saved upload — defends against extension spoofing.
+
+    Returns 'xlsx' | 'csv' or raises ValueError.
+    """
+    lower = (original_name or '').lower()
+    with open(filepath, 'rb') as fh:
+        head = fh.read(8)
+    if lower.endswith(('.xlsx', '.xls')):
+        # xlsx is a zip container; .xls (BIFF) starts with D0 CF 11 E0.
+        if head.startswith(b'PK\x03\x04'):
+            if not zipfile.is_zipfile(filepath):
+                raise ValueError('Not a valid Excel (xlsx) file')
+            return 'xlsx'
+        if head.startswith(b'\xd0\xcf\x11\xe0'):
+            return 'xlsx'  # legacy .xls — still handled by openpyxl path (will fail clearly if unreadable)
+        raise ValueError('File does not look like an Excel file')
+    if lower.endswith('.csv'):
+        # CSV has no magic bytes — at least reject anything that starts with executable headers.
+        if head.startswith((b'\x7fELF', b'MZ', b'PK\x03\x04', b'\xca\xfe\xba\xbe')):
+            raise ValueError('CSV upload rejected — file looks like a binary')
+        return 'csv'
+    raise ValueError('Unsupported file extension')
+
+
 def admin_upload():
     form = UploadForm()
     uploads = Upload.query.order_by(Upload.uploaded_at.desc()).limit(20).all()
 
     if form.validate_on_submit():
         file = form.file.data
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        original_name = secure_filename(file.filename or 'upload')
+        if not original_name:
+            flash('Invalid filename.', 'error')
+            return redirect(url_for('admin_upload'))
+
+        # UUID-prefix prevents concurrent uploads from clobbering one another mid-parse.
+        stored_name = f'{uuid.uuid4().hex}_{original_name}'
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], stored_name)
         file.save(filepath)
 
         try:
-            records, affected_pharmacies = process_upload(filepath, filename)
+            try:
+                _verify_upload_signature(filepath, original_name)
+            except ValueError as ve:
+                flash(f'File rejected: {ve}', 'error')
+                return redirect(url_for('admin_upload'))
+
+            records, affected_pharmacies, skipped = process_upload(filepath, original_name)
 
             if records == 0:
                 flash('No records found in file. Please check the file format matches the expected template.', 'error')
             else:
                 upload = Upload(
-                    filename=filename,
+                    filename=original_name,
                     uploaded_by=current_user.id,
                     records_imported=records
                 )
@@ -862,14 +1114,21 @@ def admin_upload():
                         if send_notification_email(pharmacy, stats):
                             emails_sent += 1
 
-                flash(f'Successfully imported {records} records from {filename}', 'success')
+                flash(f'Successfully imported {records} records from {original_name}', 'success')
+                if skipped:
+                    flash(f'Skipped {skipped} row(s) with invalid data', 'info')
                 if emails_sent > 0:
                     flash(f'Sent {emails_sent} notification email(s) to pharmacies', 'info')
 
-        except Exception as e:
+        except MemoryError:
             db.session.rollback()
-            logger.exception(f'Error processing upload {filename}')
-            flash(f'Error processing file: {str(e)}', 'error')
+            app.logger.exception(f'Memory exhausted parsing upload {original_name}')
+            flash('File rejected — too large or too many rows. Split it and try again.', 'error')
+        except Exception:
+            db.session.rollback()
+            app.logger.exception(f'Error processing upload {original_name}')
+            # Surface a generic message — never echo arbitrary exception strings back to the UI.
+            flash('Error processing file. Check the file format and try again.', 'error')
         finally:
             try:
                 os.remove(filepath)
@@ -996,7 +1255,7 @@ def admin_pharmacy_edit(id):
 @super_admin_required
 def admin_pharmacy_view(id):
     pharmacy = Pharmacy.query.get_or_404(id)
-    today = date.today()
+    today = _today()
     stats = get_pharmacy_stats(pharmacy.id, today)
     return render_template('admin/pharmacy_view.html', pharmacy=pharmacy, stats=stats)
 
@@ -1039,16 +1298,16 @@ def admin_user_add():
     form.organisation_id.choices = [(0, '-- No Organisation --')] + [
         (o.id, o.name) for o in Organisation.query.order_by(Organisation.name).all()
     ]
-    form.password.validators = [DataRequired(), Length(min=6, max=100)]
+    form.password.validators = [DataRequired(), Length(min=_PASSWORD_MIN, max=_PASSWORD_MAX)]
 
     if form.validate_on_submit():
-        existing = User.query.filter_by(email=form.email.data.lower()).first()
+        existing = User.query.filter_by(email=_normalize_email(form.email.data)).first()
         if existing:
             flash('A user with that email already exists.', 'error')
             return render_template('admin/user_form.html', form=form, title='Add User')
 
         user = User(
-            email=form.email.data.lower(),
+            email=_normalize_email(form.email.data),
             name=form.name.data,
             role=form.role.data,
             pharmacy_id=form.pharmacy_id.data if form.pharmacy_id.data != 0 else None,
@@ -1076,7 +1335,7 @@ def admin_user_edit(id):
     ]
 
     if form.validate_on_submit():
-        new_email = form.email.data.lower()
+        new_email = _normalize_email(form.email.data)
         if new_email != user.email:
             existing = User.query.filter_by(email=new_email).first()
             if existing:
@@ -1109,6 +1368,15 @@ def admin_user_delete(id):
     if user.id == current_user.id:
         flash('You cannot delete your own account.', 'error')
         return redirect(url_for('admin_users'))
+    # Refuse to leave the system without a super_admin.
+    if user.role in ('super_admin', 'admin'):
+        remaining = User.query.filter(
+            User.role.in_(('super_admin', 'admin')),
+            User.id != user.id,
+        ).count()
+        if remaining < 1:
+            flash('Cannot delete the last super admin.', 'error')
+            return redirect(url_for('admin_users'))
     db.session.delete(user)
     db.session.commit()
     flash(f'User "{user.name}" has been deleted.', 'success')
@@ -1184,360 +1452,489 @@ def get_pharmacy_stats(pharmacy_id, today):
     }
 
 
+def _safe_cell_int(value, default=0):
+    """Convert a spreadsheet cell to a non-negative int. Returns (int, ok)."""
+    if value is None or value == '':
+        return default, True
+    try:
+        if isinstance(value, str):
+            value = value.strip().replace(',', '')
+            if not value:
+                return default, True
+        return max(0, int(float(value))), True
+    except (TypeError, ValueError):
+        return default, False
+
+
+def _sanitize_pharmacy_name(value, fallback):
+    """Clean a pharmacy name from upload — strip control chars and bracket-style markup
+    so anything that survives is safe to store AND safe to surface through any unescaped sink
+    (email, AI summary). Output-time escaping is still applied where rendered. Bounded length.
+    """
+    if value is None:
+        return fallback
+    s = str(value)
+    # Drop NULs, control chars, and chars that anchor injection vectors (<, >, `, $).
+    cleaned = []
+    for ch in s:
+        code = ord(ch)
+        if code == 9:                 # keep tab as a normal whitespace char
+            cleaned.append(ch)
+            continue
+        if code < 32 or code == 127:  # drop ctrl chars + DEL
+            continue
+        if ch in '<>`$':              # drop injection anchors — never legitimate in pharmacy names
+            continue
+        cleaned.append(ch)
+    s = ''.join(cleaned).strip()
+    return s[:200] or fallback
+
+
+def _bounded_rows(sheet, max_rows):
+    """Materialize at most max_rows from a worksheet, raising if exceeded."""
+    rows = []
+    for i, row in enumerate(sheet.iter_rows(values_only=True)):
+        if i >= max_rows:
+            raise ValueError(
+                f'Sheet exceeds {max_rows} rows — refusing to parse. '
+                'Split the file and try again.'
+            )
+        rows.append(row)
+    return rows
+
+
 def process_upload(filepath, filename):
-    """Process CSV or Excel file and import data. Returns (records, affected_pharmacies)"""
-    records = 0
-    affected_pharmacies = {}
+    """Process CSV or Excel file and import data.
 
-    if filename.endswith('.xlsx') or filename.endswith('.xls'):
-        records, affected_pharmacies = process_excel(filepath)
-    else:
-        records, affected_pharmacies = process_csv(filepath)
-
-    return records, affected_pharmacies
+    Returns (records, affected_pharmacies, skipped_rows).
+    """
+    lower = filename.lower()
+    if lower.endswith('.xlsx') or lower.endswith('.xls'):
+        return process_excel(filepath)
+    return process_csv(filepath)
 
 
 def process_excel(filepath):
-    """Process Excel file. Returns (records, affected_pharmacies)"""
-    wb = load_workbook(filepath)
+    """Process Excel file. Returns (records, affected_pharmacies, skipped_rows)."""
+    # read_only=True streams the underlying XML; data_only=True returns evaluated values.
+    wb = load_workbook(filepath, read_only=True, data_only=True)
     records = 0
+    skipped = 0
     affected_pharmacies = {}
+    max_rows = app.config.get('UPLOAD_MAX_ROWS', 100_000)
 
-    for sheet in wb.worksheets:
-        all_rows = list(sheet.iter_rows(values_only=True))
+    try:
+        for sheet in wb.worksheets:
+            all_rows = _bounded_rows(sheet, max_rows)
 
-        daily_header_row = None
-        daily_headers = {}
-        hourly_header_row = None
-        hourly_headers = {}
+            daily_header_row = None
+            daily_headers = {}
+            hourly_header_row = None
+            hourly_headers = {}
 
-        for row_idx, row in enumerate(all_rows):
-            row_values = [str(v).lower() if v else '' for v in row]
+            for row_idx, row in enumerate(all_rows):
+                row_values = [str(v).lower() if v else '' for v in row]
 
-            if 'collected parcel distribution' in ' '.join(row_values):
-                if row_idx + 1 < len(all_rows):
-                    header_row = all_rows[row_idx + 1]
-                    hourly_header_row = row_idx + 1
-                    for col_idx, val in enumerate(header_row):
+                if 'collected parcel distribution' in ' '.join(row_values):
+                    if row_idx + 1 < len(all_rows):
+                        header_row = all_rows[row_idx + 1]
+                        hourly_header_row = row_idx + 1
+                        for col_idx, val in enumerate(header_row):
+                            if val:
+                                hourly_headers[str(val).lower().strip()] = col_idx
+
+                elif 's/n' in row_values and 'date' in row_values:
+                    daily_header_row = row_idx
+                    for col_idx, val in enumerate(row):
                         if val:
-                            hourly_headers[str(val).lower().strip()] = col_idx
+                            daily_headers[str(val).lower().strip()] = col_idx
 
-            elif 's/n' in row_values and 'date' in row_values:
-                daily_header_row = row_idx
-                for col_idx, val in enumerate(row):
-                    if val:
-                        daily_headers[str(val).lower().strip()] = col_idx
-
-        if daily_header_row is not None:
-            col_map = {
-                'serial': daily_headers.get('s/n', daily_headers.get('serial', -1)),
-                'name': daily_headers.get('pharmacy name', daily_headers.get('name', -1)),
-                'date': daily_headers.get('date', -1),
-                'loaded': daily_headers.get('loaded parcels', daily_headers.get('loaded', -1)),
-                'collected': daily_headers.get('collected parcels', daily_headers.get('collected', -1)),
-                'removed': daily_headers.get('removed parcels', daily_headers.get('removed', -1)),
-                'reminders': daily_headers.get('reminders sum', daily_headers.get('reminders', -1))
-            }
-
-            end_row = hourly_header_row - 1 if hourly_header_row else len(all_rows)
-
-            for row in all_rows[daily_header_row + 1:end_row]:
-                if not row or col_map['serial'] < 0 or not row[col_map['serial']]:
-                    continue
-
-                serial_val = row[col_map['serial']]
-                if isinstance(serial_val, (int, float)):
-                    serial = str(int(serial_val))
-                else:
-                    serial = str(serial_val).strip()
-
-                if not serial.isdigit():
-                    continue
-
-                name = str(row[col_map['name']]).strip() if col_map['name'] >= 0 and row[col_map['name']] else serial
-
-                pharmacy = Pharmacy.query.filter_by(serial_number=serial).first()
-                if not pharmacy:
-                    pharmacy = Pharmacy(serial_number=serial, name=name)
-                    db.session.add(pharmacy)
-                    db.session.flush()
-
-                date_val = row[col_map['date']]
-                if isinstance(date_val, datetime):
-                    stat_date = date_val.date()
-                elif isinstance(date_val, date):
-                    stat_date = date_val
-                else:
-                    continue
-
-                loaded = int(row[col_map['loaded']] or 0) if col_map['loaded'] >= 0 and row[col_map['loaded']] else 0
-                collected = int(row[col_map['collected']] or 0) if col_map['collected'] >= 0 and row[col_map['collected']] else 0
-                removed = int(row[col_map['removed']] or 0) if col_map['removed'] >= 0 and row[col_map['removed']] else 0
-                reminders = int(row[col_map['reminders']] or 0) if col_map['reminders'] >= 0 and row[col_map['reminders']] else 0
-
-                stat = DailyStat.query.filter_by(pharmacy_id=pharmacy.id, date=stat_date).first()
-                if stat:
-                    stat.loaded_parcels = loaded
-                    stat.collected_parcels = collected
-                    stat.removed_parcels = removed
-                    stat.reminders_sum = reminders
-                else:
-                    stat = DailyStat(
-                        pharmacy_id=pharmacy.id,
-                        date=stat_date,
-                        loaded_parcels=loaded,
-                        collected_parcels=collected,
-                        removed_parcels=removed,
-                        reminders_sum=reminders
-                    )
-                    db.session.add(stat)
-
-                if pharmacy.id not in affected_pharmacies:
-                    affected_pharmacies[pharmacy.id] = {'loaded': 0, 'collected': 0, 'removed': 0}
-                affected_pharmacies[pharmacy.id]['loaded'] += loaded
-                affected_pharmacies[pharmacy.id]['collected'] += collected
-                affected_pharmacies[pharmacy.id]['removed'] += removed
-
-                records += 1
-
-        if hourly_header_row is not None:
-            hourly_col_map = {
-                'serial': hourly_headers.get('s/n', hourly_headers.get('serial', -1)),
-                'name': hourly_headers.get('pharmacy name', hourly_headers.get('name', -1)),
-                'period': hourly_headers.get('period from-to hrs', hourly_headers.get('period', -1)),
-                'collected': hourly_headers.get('collected parcels', hourly_headers.get('collected', -1))
-            }
-
-            report_month = date.today().replace(day=1)
+            col_map = {}
             if daily_header_row is not None:
-                for row in all_rows[daily_header_row + 1:]:
-                    if row and col_map['date'] >= 0 and row[col_map['date']]:
-                        date_val = row[col_map['date']]
-                        if isinstance(date_val, datetime):
-                            report_month = date_val.date().replace(day=1)
-                            break
-                        elif isinstance(date_val, date):
-                            report_month = date_val.replace(day=1)
-                            break
+                col_map = {
+                    'serial': daily_headers.get('s/n', daily_headers.get('serial', -1)),
+                    'name': daily_headers.get('pharmacy name', daily_headers.get('name', -1)),
+                    'date': daily_headers.get('date', -1),
+                    'loaded': daily_headers.get('loaded parcels', daily_headers.get('loaded', -1)),
+                    'collected': daily_headers.get('collected parcels', daily_headers.get('collected', -1)),
+                    'removed': daily_headers.get('removed parcels', daily_headers.get('removed', -1)),
+                    'reminders': daily_headers.get('reminders sum', daily_headers.get('reminders', -1))
+                }
 
-            for row in all_rows[hourly_header_row + 1:]:
-                if not row or hourly_col_map['serial'] < 0 or not row[hourly_col_map['serial']]:
-                    continue
+                end_row = hourly_header_row - 1 if hourly_header_row else len(all_rows)
 
-                serial_val = row[hourly_col_map['serial']]
-                if isinstance(serial_val, (int, float)):
-                    serial = str(int(serial_val))
-                else:
-                    serial = str(serial_val).strip()
+                for row in all_rows[daily_header_row + 1:end_row]:
+                    if not row or col_map['serial'] < 0 or not row[col_map['serial']]:
+                        continue
 
-                if not serial.isdigit():
-                    continue
+                    serial_val = row[col_map['serial']]
+                    if isinstance(serial_val, (int, float)):
+                        serial = str(int(serial_val))
+                    else:
+                        serial = str(serial_val).strip()
 
-                period = str(row[hourly_col_map['period']]).strip() if hourly_col_map['period'] >= 0 and row[hourly_col_map['period']] else None
-                if not period:
-                    continue
+                    if not serial.isdigit() or len(serial) > 50:
+                        skipped += 1
+                        continue
 
-                collected = int(row[hourly_col_map['collected']] or 0) if hourly_col_map['collected'] >= 0 and row[hourly_col_map['collected']] else 0
+                    raw_name = row[col_map['name']] if col_map['name'] >= 0 else None
+                    name = _sanitize_pharmacy_name(raw_name, serial)
 
-                pharmacy = Pharmacy.query.filter_by(serial_number=serial).first()
-                if not pharmacy:
-                    name = str(row[hourly_col_map['name']]).strip() if hourly_col_map['name'] >= 0 and row[hourly_col_map['name']] else serial
-                    pharmacy = Pharmacy(serial_number=serial, name=name)
-                    db.session.add(pharmacy)
-                    db.session.flush()
+                    date_val = row[col_map['date']]
+                    if isinstance(date_val, datetime):
+                        stat_date = date_val.date()
+                    elif isinstance(date_val, date):
+                        stat_date = date_val
+                    else:
+                        skipped += 1
+                        continue
 
-                hourly = HourlyDistribution.query.filter_by(
-                    pharmacy_id=pharmacy.id,
-                    period=period,
-                    month=report_month
-                ).first()
+                    # Each int conversion is independent — a single bad cell skips the row,
+                    # not the whole upload.
+                    loaded, ok_l = _safe_cell_int(row[col_map['loaded']] if col_map['loaded'] >= 0 else 0)
+                    collected, ok_c = _safe_cell_int(row[col_map['collected']] if col_map['collected'] >= 0 else 0)
+                    removed, ok_r = _safe_cell_int(row[col_map['removed']] if col_map['removed'] >= 0 else 0)
+                    reminders, ok_rem = _safe_cell_int(row[col_map['reminders']] if col_map['reminders'] >= 0 else 0)
+                    if not (ok_l and ok_c and ok_r and ok_rem):
+                        skipped += 1
+                        continue
 
-                if hourly:
-                    hourly.collected_parcels = collected
-                else:
-                    hourly = HourlyDistribution(
+                    pharmacy = Pharmacy.query.filter_by(serial_number=serial).first()
+                    if not pharmacy:
+                        pharmacy = Pharmacy(serial_number=serial, name=name)
+                        db.session.add(pharmacy)
+                        db.session.flush()
+
+                    stat = DailyStat.query.filter_by(pharmacy_id=pharmacy.id, date=stat_date).first()
+                    if stat:
+                        stat.loaded_parcels = loaded
+                        stat.collected_parcels = collected
+                        stat.removed_parcels = removed
+                        stat.reminders_sum = reminders
+                    else:
+                        stat = DailyStat(
+                            pharmacy_id=pharmacy.id,
+                            date=stat_date,
+                            loaded_parcels=loaded,
+                            collected_parcels=collected,
+                            removed_parcels=removed,
+                            reminders_sum=reminders
+                        )
+                        db.session.add(stat)
+
+                    if pharmacy.id not in affected_pharmacies:
+                        affected_pharmacies[pharmacy.id] = {'loaded': 0, 'collected': 0, 'removed': 0}
+                    affected_pharmacies[pharmacy.id]['loaded'] += loaded
+                    affected_pharmacies[pharmacy.id]['collected'] += collected
+                    affected_pharmacies[pharmacy.id]['removed'] += removed
+
+                    records += 1
+
+            if hourly_header_row is not None:
+                hourly_col_map = {
+                    'serial': hourly_headers.get('s/n', hourly_headers.get('serial', -1)),
+                    'name': hourly_headers.get('pharmacy name', hourly_headers.get('name', -1)),
+                    'period': hourly_headers.get('period from-to hrs', hourly_headers.get('period', -1)),
+                    'collected': hourly_headers.get('collected parcels', hourly_headers.get('collected', -1))
+                }
+
+                report_month = _today().replace(day=1)
+                if daily_header_row is not None and col_map.get('date', -1) >= 0:
+                    for row in all_rows[daily_header_row + 1:]:
+                        if row and row[col_map['date']]:
+                            date_val = row[col_map['date']]
+                            if isinstance(date_val, datetime):
+                                report_month = date_val.date().replace(day=1)
+                                break
+                            elif isinstance(date_val, date):
+                                report_month = date_val.replace(day=1)
+                                break
+
+                for row in all_rows[hourly_header_row + 1:]:
+                    if not row or hourly_col_map['serial'] < 0 or not row[hourly_col_map['serial']]:
+                        continue
+
+                    serial_val = row[hourly_col_map['serial']]
+                    if isinstance(serial_val, (int, float)):
+                        serial = str(int(serial_val))
+                    else:
+                        serial = str(serial_val).strip()
+
+                    if not serial.isdigit() or len(serial) > 50:
+                        skipped += 1
+                        continue
+
+                    period = (
+                        str(row[hourly_col_map['period']]).strip()[:10]
+                        if hourly_col_map['period'] >= 0 and row[hourly_col_map['period']]
+                        else None
+                    )
+                    if not period:
+                        continue
+
+                    collected, ok = _safe_cell_int(
+                        row[hourly_col_map['collected']] if hourly_col_map['collected'] >= 0 else 0
+                    )
+                    if not ok:
+                        skipped += 1
+                        continue
+
+                    pharmacy = Pharmacy.query.filter_by(serial_number=serial).first()
+                    if not pharmacy:
+                        raw_name = row[hourly_col_map['name']] if hourly_col_map['name'] >= 0 else None
+                        name = _sanitize_pharmacy_name(raw_name, serial)
+                        pharmacy = Pharmacy(serial_number=serial, name=name)
+                        db.session.add(pharmacy)
+                        db.session.flush()
+
+                    hourly = HourlyDistribution.query.filter_by(
                         pharmacy_id=pharmacy.id,
                         period=period,
-                        collected_parcels=collected,
                         month=report_month
-                    )
-                    db.session.add(hourly)
+                    ).first()
 
-    db.session.commit()
-    return records, affected_pharmacies
+                    if hourly:
+                        hourly.collected_parcels = collected
+                    else:
+                        hourly = HourlyDistribution(
+                            pharmacy_id=pharmacy.id,
+                            period=period,
+                            collected_parcels=collected,
+                            month=report_month
+                        )
+                        db.session.add(hourly)
+
+        db.session.commit()
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+    return records, affected_pharmacies, skipped
 
 
 def process_csv(filepath):
-    """Process CSV file. Returns (records, affected_pharmacies)"""
+    """Process CSV file. Returns (records, affected_pharmacies, skipped_rows)."""
     records = 0
+    skipped = 0
     affected_pharmacies = {}
+    max_rows = app.config.get('UPLOAD_MAX_ROWS', 100_000)
 
     with open(filepath, 'r', encoding='utf-8-sig') as f:
-        lines = f.readlines()
-
-        header_idx = None
-        for idx, line in enumerate(lines):
-            line_lower = line.lower()
-            if 's/n' in line_lower and ('pharmacy' in line_lower or 'date' in line_lower):
-                header_idx = idx
-                break
-
-        if header_idx is None:
-            return 0, {}
-
-        from io import StringIO
-        csv_content = ''.join(lines[header_idx:])
-        reader = csv.DictReader(StringIO(csv_content))
-
-        fieldnames = {k.lower().strip(): k for k in reader.fieldnames if k}
-
-        for row in reader:
-            serial_key = fieldnames.get('s/n', fieldnames.get('serial', fieldnames.get('serial number')))
-            if not serial_key or not row.get(serial_key):
-                continue
-
-            serial = str(row[serial_key]).strip()
-
-            if not serial.isdigit():
-                continue
-
-            name_key = fieldnames.get('pharmacy name', fieldnames.get('name'))
-            name = row.get(name_key, serial) if name_key else serial
-
-            if not name or not name.strip():
-                name = serial
-
-            pharmacy = Pharmacy.query.filter_by(serial_number=serial).first()
-            if not pharmacy:
-                pharmacy = Pharmacy(serial_number=serial, name=name.strip())
-                db.session.add(pharmacy)
-                db.session.flush()
-
-            date_key = fieldnames.get('date')
-            if not date_key or not row.get(date_key):
-                continue
-
-            date_str = row[date_key].strip()
-            if not date_str:
-                continue
-
-            try:
-                stat_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-            except ValueError:
-                try:
-                    stat_date = datetime.strptime(date_str, '%d/%m/%Y').date()
-                except ValueError:
-                    continue
-
-            loaded = int(row.get(fieldnames.get('loaded parcels', fieldnames.get('loaded', '')), 0) or 0)
-            collected = int(row.get(fieldnames.get('collected parcels', fieldnames.get('collected', '')), 0) or 0)
-            removed = int(row.get(fieldnames.get('removed parcels', fieldnames.get('removed', '')), 0) or 0)
-            reminders = int(row.get(fieldnames.get('reminders sum', fieldnames.get('reminders', '')), 0) or 0)
-
-            stat = DailyStat.query.filter_by(pharmacy_id=pharmacy.id, date=stat_date).first()
-            if stat:
-                stat.loaded_parcels = loaded
-                stat.collected_parcels = collected
-                stat.removed_parcels = removed
-                stat.reminders_sum = reminders
-            else:
-                stat = DailyStat(
-                    pharmacy_id=pharmacy.id,
-                    date=stat_date,
-                    loaded_parcels=loaded,
-                    collected_parcels=collected,
-                    removed_parcels=removed,
-                    reminders_sum=reminders
+        lines = []
+        for i, line in enumerate(f):
+            if i >= max_rows:
+                raise ValueError(
+                    f'CSV exceeds {max_rows} rows — refusing to parse. '
+                    'Split the file and try again.'
                 )
-                db.session.add(stat)
+            lines.append(line)
 
-            if pharmacy.id not in affected_pharmacies:
-                affected_pharmacies[pharmacy.id] = {'loaded': 0, 'collected': 0, 'removed': 0}
-            affected_pharmacies[pharmacy.id]['loaded'] += loaded
-            affected_pharmacies[pharmacy.id]['collected'] += collected
-            affected_pharmacies[pharmacy.id]['removed'] += removed
+    header_idx = None
+    for idx, line in enumerate(lines):
+        line_lower = line.lower()
+        if 's/n' in line_lower and ('pharmacy' in line_lower or 'date' in line_lower):
+            header_idx = idx
+            break
 
-            records += 1
+    if header_idx is None:
+        return 0, {}, 0
+
+    from io import StringIO
+    csv_content = ''.join(lines[header_idx:])
+    reader = csv.DictReader(StringIO(csv_content))
+
+    if not reader.fieldnames:
+        return 0, {}, 0
+    fieldnames = {k.lower().strip(): k for k in reader.fieldnames if k}
+
+    if not (fieldnames.get('s/n') or fieldnames.get('serial') or fieldnames.get('serial number')):
+        raise ValueError('CSV is missing required column: S/N')
+
+    for row in reader:
+        serial_key = fieldnames.get('s/n', fieldnames.get('serial', fieldnames.get('serial number')))
+        if not serial_key or not row.get(serial_key):
+            continue
+
+        serial = str(row[serial_key]).strip()
+        if not serial.isdigit() or len(serial) > 50:
+            skipped += 1
+            continue
+
+        name_key = fieldnames.get('pharmacy name', fieldnames.get('name'))
+        raw_name = row.get(name_key) if name_key else None
+        name = _sanitize_pharmacy_name(raw_name, serial)
+
+        date_key = fieldnames.get('date')
+        if not date_key or not row.get(date_key):
+            continue
+
+        date_str = (row.get(date_key) or '').strip()
+        if not date_str:
+            continue
+
+        try:
+            stat_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except ValueError:
+            try:
+                stat_date = datetime.strptime(date_str, '%d/%m/%Y').date()
+            except ValueError:
+                skipped += 1
+                continue
+
+        loaded, ok_l = _safe_cell_int(row.get(fieldnames.get('loaded parcels', fieldnames.get('loaded', '')), 0))
+        collected, ok_c = _safe_cell_int(row.get(fieldnames.get('collected parcels', fieldnames.get('collected', '')), 0))
+        removed, ok_r = _safe_cell_int(row.get(fieldnames.get('removed parcels', fieldnames.get('removed', '')), 0))
+        reminders, ok_rem = _safe_cell_int(row.get(fieldnames.get('reminders sum', fieldnames.get('reminders', '')), 0))
+        if not (ok_l and ok_c and ok_r and ok_rem):
+            skipped += 1
+            continue
+
+        pharmacy = Pharmacy.query.filter_by(serial_number=serial).first()
+        if not pharmacy:
+            pharmacy = Pharmacy(serial_number=serial, name=name)
+            db.session.add(pharmacy)
+            db.session.flush()
+
+        stat = DailyStat.query.filter_by(pharmacy_id=pharmacy.id, date=stat_date).first()
+        if stat:
+            stat.loaded_parcels = loaded
+            stat.collected_parcels = collected
+            stat.removed_parcels = removed
+            stat.reminders_sum = reminders
+        else:
+            stat = DailyStat(
+                pharmacy_id=pharmacy.id,
+                date=stat_date,
+                loaded_parcels=loaded,
+                collected_parcels=collected,
+                removed_parcels=removed,
+                reminders_sum=reminders
+            )
+            db.session.add(stat)
+
+        if pharmacy.id not in affected_pharmacies:
+            affected_pharmacies[pharmacy.id] = {'loaded': 0, 'collected': 0, 'removed': 0}
+        affected_pharmacies[pharmacy.id]['loaded'] += loaded
+        affected_pharmacies[pharmacy.id]['collected'] += collected
+        affected_pharmacies[pharmacy.id]['removed'] += removed
+
+        records += 1
 
     db.session.commit()
-    return records, affected_pharmacies
+    return records, affected_pharmacies, skipped
+
+
+# Advisory-lock key for init_db. Arbitrary 32-bit constant — change only if you also clear locks.
+_INIT_DB_LOCK_KEY = 73247932
 
 
 def init_db():
-    """Initialize database with tables, run migrations, sync admin user."""
+    """Initialize database with tables, run migrations, sync admin user.
+
+    Serialised via a Postgres advisory lock so concurrent gunicorn workers don't race
+    on DDL or admin-sync. Fails loudly — no silent fallbacks.
+    """
     from sqlalchemy import text
 
     with app.app_context():
-        try:
-            # Step 1: Migrate existing tables BEFORE db.create_all()
-            # This ensures columns exist before SQLAlchemy tries to use the ORM
-            db_url = str(db.engine.url)
-            is_postgres = 'postgresql' in db_url or 'postgres' in db_url
+        db_url = str(db.engine.url)
+        is_postgres = 'postgresql' in db_url or 'postgres' in db_url
 
+        try:
             if is_postgres:
                 with db.engine.connect() as conn:
-                    # Create organisations table if it doesn't exist (raw SQL)
-                    conn.execute(text("""
-                        CREATE TABLE IF NOT EXISTS organisations (
-                            id SERIAL PRIMARY KEY,
-                            name VARCHAR(200) NOT NULL,
-                            created_at TIMESTAMP DEFAULT NOW()
-                        )
-                    """))
-                    conn.execute(text('ALTER TABLE pharmacies ADD COLUMN IF NOT EXISTS organisation_id INTEGER REFERENCES organisations(id)'))
-                    conn.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS organisation_id INTEGER REFERENCES organisations(id)'))
-                    conn.execute(text("UPDATE users SET role = 'super_admin' WHERE role = 'admin'"))
+                    # Block until we hold the lock — only one worker at a time runs DDL.
+                    conn.execute(text(f'SELECT pg_advisory_lock({_INIT_DB_LOCK_KEY})'))
+                    try:
+                        conn.execute(text("""
+                            CREATE TABLE IF NOT EXISTS organisations (
+                                id SERIAL PRIMARY KEY,
+                                name VARCHAR(200) NOT NULL,
+                                created_at TIMESTAMP DEFAULT NOW()
+                            )
+                        """))
+                        conn.execute(text('ALTER TABLE pharmacies ADD COLUMN IF NOT EXISTS organisation_id INTEGER REFERENCES organisations(id)'))
+                        conn.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS organisation_id INTEGER REFERENCES organisations(id)'))
+                        # session_version supports forced logout / token invalidation.
+                        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS session_version INTEGER NOT NULL DEFAULT 1"))
+                        conn.execute(text("UPDATE users SET role = 'super_admin' WHERE role = 'admin'"))
+                        conn.commit()
+                        app.logger.info('PostgreSQL migration complete')
+                    finally:
+                        conn.execute(text(f'SELECT pg_advisory_unlock({_INIT_DB_LOCK_KEY})'))
+                        conn.commit()
+            else:
+                # SQLite (local dev). Idempotent ADD COLUMNs — SQLite has no IF NOT EXISTS,
+                # so we introspect first.
+                with db.engine.connect() as conn:
+                    def _user_columns():
+                        rows = conn.execute(text("PRAGMA table_info(users)")).fetchall()
+                        return {r[1] for r in rows}
+                    def _pharm_columns():
+                        rows = conn.execute(text("PRAGMA table_info(pharmacies)")).fetchall()
+                        return {r[1] for r in rows}
+                    user_cols = _user_columns()
+                    pharm_cols = _pharm_columns()
+                    if user_cols and 'organisation_id' not in user_cols:
+                        conn.execute(text('ALTER TABLE users ADD COLUMN organisation_id INTEGER'))
+                    if user_cols and 'session_version' not in user_cols:
+                        conn.execute(text('ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 1'))
+                    if pharm_cols and 'organisation_id' not in pharm_cols:
+                        conn.execute(text('ALTER TABLE pharmacies ADD COLUMN organisation_id INTEGER'))
+                    if user_cols:
+                        conn.execute(text("UPDATE users SET role = 'super_admin' WHERE role = 'admin'"))
                     conn.commit()
-                    print('PostgreSQL migration complete')
 
-            # Step 2: Now safe to run create_all (new tables + ORM columns all match)
             db.create_all()
-            print('db.create_all() complete')
+            app.logger.info('db.create_all() complete')
 
-            # Step 3: Sync admin credentials
+            # Sync admin credentials. NO default-password fallback.
             admin_email = os.environ.get('ADMIN_EMAIL', 'admin@pharmabox24.com').strip().lower()
             admin_password = os.environ.get('ADMIN_PASSWORD', '').strip()
 
+            existing_super = User.query.filter_by(role='super_admin').first()
+
             if admin_password:
-                admin = User.query.filter_by(role='super_admin').first()
-                if not admin:
-                    admin = User.query.filter_by(email=admin_email).first()
-                if admin:
-                    admin.email = admin_email
-                    admin.role = 'super_admin'
-                    admin.set_password(admin_password)
-                    db.session.commit()
-                    print(f'Super admin credentials synced: {admin_email}')
+                if len(admin_password) < _PASSWORD_MIN:
+                    app.logger.error(
+                        f'ADMIN_PASSWORD is shorter than {_PASSWORD_MIN} characters — refusing to sync admin.'
+                    )
                 else:
-                    admin = User(
-                        email=admin_email,
-                        name='Administrator',
-                        role='super_admin'
-                    )
-                    admin.set_password(admin_password)
-                    db.session.add(admin)
-                    db.session.commit()
-                    print(f'Created super admin user: {admin_email}')
+                    admin = existing_super or User.query.filter_by(email=admin_email).first()
+                    if admin:
+                        admin.email = admin_email
+                        admin.role = 'super_admin'
+                        admin.set_password(admin_password)
+                        db.session.commit()
+                        app.logger.info(f'Super admin credentials synced: {admin_email}')
+                    else:
+                        admin = User(email=admin_email, name='Administrator', role='super_admin')
+                        admin.set_password(admin_password)
+                        db.session.add(admin)
+                        db.session.commit()
+                        app.logger.info(f'Created super admin user: {admin_email}')
             else:
-                if not User.query.filter_by(role='super_admin').first():
-                    admin = User(
-                        email=admin_email,
-                        name='Administrator',
-                        role='super_admin'
+                if not existing_super and os.environ.get('PHARMABOX_ENV') != 'development':
+                    # Hard-fail: never auto-create a default-credential admin in production.
+                    raise RuntimeError(
+                        'No super_admin exists and ADMIN_PASSWORD env var is not set. '
+                        'Set ADMIN_PASSWORD (>= 12 chars) and restart, or create the super_admin '
+                        'manually before bringing the app up.'
                     )
-                    admin.set_password('changeme123')
-                    db.session.add(admin)
-                    db.session.commit()
-                    print(f'Created default super admin: {admin_email} / changeme123')
+                if not existing_super:
+                    app.logger.warning('Development mode: no super_admin and no ADMIN_PASSWORD. Set ADMIN_PASSWORD to bootstrap.')
 
-        except Exception as e:
-            print(f'init_db error: {e}')
-            import traceback
-            traceback.print_exc()
+        except Exception:
+            # Surface init failures loudly. Do NOT silently continue serving against a broken schema.
+            app.logger.exception('init_db failed')
+            raise
 
 
-# Initialize DB on import (for gunicorn)
+# Initialize DB on import (for gunicorn). Failure here MUST crash the worker so the
+# orchestrator can detect a broken deploy instead of serving 500s against a half-migrated DB.
 init_db()
 
+
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(debug=os.environ.get('FLASK_DEBUG') == '1', port=5000)

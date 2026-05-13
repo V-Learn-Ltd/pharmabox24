@@ -28,26 +28,35 @@ class User(UserMixin, db.Model):
     password_hash = db.Column(db.String(256), nullable=False)
     name = db.Column(db.String(100), nullable=False)
     role = db.Column(db.String(20), nullable=False, default='pharmacy')  # 'super_admin', 'org_admin', 'pharmacy'
-    pharmacy_id = db.Column(db.Integer, db.ForeignKey('pharmacies.id'), nullable=True)
-    organisation_id = db.Column(db.Integer, db.ForeignKey('organisations.id'), nullable=True)
+    pharmacy_id = db.Column(db.Integer, db.ForeignKey('pharmacies.id'), nullable=True, index=True)
+    organisation_id = db.Column(db.Integer, db.ForeignKey('organisations.id'), nullable=True, index=True)
+    # Bumped on password change / forced logout to invalidate outstanding sessions and reset tokens.
+    session_version = db.Column(db.Integer, nullable=False, default=1, server_default='1')
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
     pharmacy = db.relationship('Pharmacy', backref='users')
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password, method='pbkdf2:sha256')
+        # Invalidate every outstanding session and reset token tied to this user.
+        self.session_version = (self.session_version or 1) + 1
 
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
 
+    def get_id(self):
+        """Bind session cookie to session_version — bumping it logs the user out everywhere."""
+        return f'{self.id}|{self.session_version or 1}'
+
     def is_super_admin(self):
+        # Legacy 'admin' role kept as a safety net until init_db migration is verified across all envs.
         return self.role in ('super_admin', 'admin')
 
     def is_org_admin(self):
         return self.role == 'org_admin'
 
     def is_admin(self):
-        """Returns True for super_admin OR org_admin (backwards compat for templates)."""
+        """Returns True for super_admin OR org_admin (used by templates)."""
         return self.role in ('super_admin', 'org_admin', 'admin')
 
 
@@ -58,7 +67,7 @@ class Pharmacy(db.Model):
     serial_number = db.Column(db.String(50), unique=True, nullable=False)
     name = db.Column(db.String(200), nullable=False)
     notification_email = db.Column(db.String(120), nullable=True)
-    organisation_id = db.Column(db.Integer, db.ForeignKey('organisations.id'), nullable=True)
+    organisation_id = db.Column(db.Integer, db.ForeignKey('organisations.id'), nullable=True, index=True)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
     daily_stats = db.relationship('DailyStat', backref='pharmacy', lazy='dynamic')

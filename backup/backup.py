@@ -8,9 +8,12 @@ Keeps the 7 most recent backups, deletes the rest.
 
 import os
 import sys
+import gzip
+import shutil
 import subprocess
 import glob
 from datetime import datetime
+from urllib.parse import urlparse
 
 BACKUP_DIR = os.environ.get('BACKUP_DIR', '/data/backups')
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
@@ -48,6 +51,26 @@ def send_alert(subject, message):
         print(f'Failed to send alert email: {e}')
 
 
+def _libpq_env_from_url(db_url):
+    """Convert a postgresql:// URL into libpq env vars so pg_dump never sees the
+    password on the command line or in a shell-interpreted string."""
+    parsed = urlparse(db_url)
+    if parsed.scheme not in ('postgres', 'postgresql'):
+        raise ValueError(f'Unsupported DATABASE_URL scheme: {parsed.scheme!r}')
+    env = os.environ.copy()
+    if parsed.hostname:
+        env['PGHOST'] = parsed.hostname
+    if parsed.port:
+        env['PGPORT'] = str(parsed.port)
+    if parsed.username:
+        env['PGUSER'] = parsed.username
+    if parsed.password:
+        env['PGPASSWORD'] = parsed.password
+    if parsed.path and len(parsed.path) > 1:
+        env['PGDATABASE'] = parsed.path.lstrip('/')
+    return env
+
+
 def run_backup():
     if not DATABASE_URL:
         print('ERROR: DATABASE_URL not set')
@@ -58,6 +81,13 @@ def run_backup():
     db_url = DATABASE_URL
     if db_url.startswith('postgres://'):
         db_url = db_url.replace('postgres://', 'postgresql://', 1)
+
+    try:
+        env = _libpq_env_from_url(db_url)
+    except ValueError as ve:
+        print(f'ERROR: {ve}')
+        send_alert('FAILED', str(ve))
+        sys.exit(1)
 
     # Create backup directory
     os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -70,26 +100,32 @@ def run_backup():
     print(f'Starting backup: {filename}')
     print(f'Backup directory: {BACKUP_DIR}')
 
-    # Run pg_dump piped through gzip
+    # Stream pg_dump through gzip in pure Python — no shell, no command injection.
+    proc = None
     try:
-        result = subprocess.run(
-            f'pg_dump "{db_url}" | gzip > "{filepath}"',
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=300  # 5 minute timeout
-        )
+        with gzip.open(filepath, 'wb') as gz_out:
+            proc = subprocess.Popen(
+                ['pg_dump', '--no-password', '--format=plain'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            )
+            shutil.copyfileobj(proc.stdout, gz_out)
+            try:
+                _, stderr = proc.communicate(timeout=300)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                raise
 
-        if result.returncode != 0:
-            error_msg = result.stderr.strip()
-            print(f'ERROR: pg_dump failed: {error_msg}')
-            send_alert('FAILED', f'pg_dump failed with error: {error_msg}')
-            # Clean up empty/failed file
+        if proc.returncode != 0:
+            error_msg = (stderr or b'').decode('utf-8', errors='replace').strip()
+            print(f'ERROR: pg_dump failed (rc={proc.returncode}): {error_msg}')
+            send_alert('FAILED', f'pg_dump failed (rc={proc.returncode}): {error_msg}')
             if os.path.exists(filepath):
                 os.remove(filepath)
             sys.exit(1)
 
-        # Verify the backup file exists and has content
         if not os.path.exists(filepath):
             print('ERROR: Backup file was not created')
             send_alert('FAILED', 'Backup file was not created.')
@@ -111,9 +147,25 @@ def run_backup():
         if os.path.exists(filepath):
             os.remove(filepath)
         sys.exit(1)
+    except FileNotFoundError:
+        # pg_dump binary missing on the host
+        print('ERROR: pg_dump binary not found on PATH')
+        send_alert('FAILED', 'pg_dump binary not found on PATH — install postgresql-client.')
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        sys.exit(1)
     except Exception as e:
         print(f'ERROR: Unexpected error: {e}')
         send_alert('FAILED', f'Unexpected error: {e}')
+        if proc and proc.poll() is None:
+            proc.kill()
+        if os.path.exists(filepath):
+            # Don't keep a half-written backup hanging around.
+            try:
+                if os.path.getsize(filepath) == 0:
+                    os.remove(filepath)
+            except OSError:
+                pass
         sys.exit(1)
 
     # Rotate old backups — keep only the most recent N
